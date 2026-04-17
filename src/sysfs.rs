@@ -42,6 +42,19 @@ pub struct TimeStat {
     pub max_ns: u64,
 }
 
+/// Full time_stats entry from JSON.
+#[derive(Debug, Clone, Default)]
+pub struct TimeStatFull {
+    pub name: String,
+    pub count: u64,
+    pub dur_min_ns: u64,
+    pub dur_max_ns: u64,
+    pub dur_mean_ns: u64,
+    pub dur_recent_ns: u64,
+    pub dur_stddev_ns: u64,
+    pub dur_recent_stddev_ns: u64,
+}
+
 /// Snapshot of all metrics for one filesystem at one point in time.
 #[derive(Debug, Clone, Default)]
 pub struct FsSnapshot {
@@ -53,6 +66,8 @@ pub struct FsSnapshot {
     pub recent_btree_read_us: f64,
     /// Blocked stats: (name, cumulative_count, recent_mean_us).
     pub blocked_stats: Vec<(String, u64, f64)>,
+    /// All time_stats from JSON: full detail per operation.
+    pub all_time_stats: Vec<TimeStatFull>,
     /// Compression: (compressed_bytes, uncompressed_bytes).
     pub compression: (u64, u64),
     pub devices: Vec<DeviceInfo>,
@@ -125,6 +140,7 @@ pub fn snapshot(fs: &BcachefsFs) -> FsSnapshot {
     snap.recent_btree_read_us = read_recent_mean_us(&fs.sysfs, "btree_node_read");
     snap.blocked_stats = read_blocked_stats(&fs.sysfs);
     snap.compression = read_compression_stats(&fs.sysfs);
+    snap.all_time_stats = read_all_time_stats_json(&fs.sysfs);
     snap.devices = read_devices(&fs.sysfs);
     snap.options = read_options(&fs.sysfs);
     snap.background = read_background(&fs.sysfs, &fs.mount_point);
@@ -336,13 +352,19 @@ fn read_background(sysfs: &Path, mount_point: &str) -> Vec<(String, String)> {
     // Fixed order for stable rendering
     let mut result = Vec::new();
 
-    // Reconcile status (replication health)
-    result.push(("reconcile".to_string(), read_reconcile_status(mount_point)));
+    // Reconcile — check if enabled first
+    let reconcile_enabled = std::fs::read_to_string(opts.join("reconcile_enabled"))
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    if reconcile_enabled {
+        result.push(("reconcile".to_string(), read_reconcile_status(mount_point)));
+    } else {
+        result.push(("reconcile".to_string(), "off".into()));
+    }
 
     // Only show background ops that actually have a sysfs toggle
     for prefix in ["rebalance", "copygc"] {
         let enabled_path = opts.join(format!("{prefix}_enabled"));
-        let status_path = dir.join(format!("{prefix}_status"));
 
         // Skip if the option doesn't exist on this kernel
         if !enabled_path.exists() {
@@ -353,21 +375,35 @@ fn read_background(sysfs: &Path, mount_point: &str) -> Vec<(String, String)> {
             .map(|v| v.trim() == "1")
             .unwrap_or(false);
 
-        let status = std::fs::read_to_string(&status_path)
-            .unwrap_or_else(|_| "n/a".into())
-            .trim()
-            .lines()
-            .next()
-            .unwrap_or("n/a")
-            .to_string();
+        if !enabled {
+            result.push((prefix.to_string(), "off".into()));
+            continue;
+        }
 
-        let display = if enabled {
-            format!("on — {status}")
-        } else {
-            "off".into()
-        };
+        // Try multiple status file names (varies by kernel version)
+        let status_names = [
+            format!("{prefix}_status"),
+            format!("copy_gc_wait"),
+        ];
+        let mut status = String::new();
+        for name in &status_names {
+            let path = dir.join(name);
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let running = content.lines()
+                    .find(|l| l.trim().starts_with("running:"))
+                    .and_then(|l| l.split(':').last())
+                    .map(|v| v.trim() == "1")
+                    .unwrap_or(false);
 
-        result.push((prefix.to_string(), display));
+                status = if running { "working".into() } else { "idle".into() };
+                break;
+            }
+        }
+        if status.is_empty() {
+            status = "enabled".into();
+        }
+
+        result.push((prefix.to_string(), status));
     }
     result
 }
@@ -422,6 +458,43 @@ fn to_microseconds(val: f64, unit: &str) -> f64 {
         "h" => val * 3_600_000_000.0,
         _ => val,
     }
+}
+
+/// Read all time_stats from JSON files.
+fn read_all_time_stats_json(sysfs: &Path) -> Vec<TimeStatFull> {
+    let dir = sysfs.join("time_stats_json");
+    let mut result = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let content = match std::fs::read_to_string(entry.path()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let count = json["count"].as_u64().unwrap_or(0);
+        if count == 0 {
+            continue; // skip entries with zero count
+        }
+        result.push(TimeStatFull {
+            name,
+            count,
+            dur_min_ns: json["duration_ns"]["min"].as_u64().unwrap_or(0),
+            dur_max_ns: json["duration_ns"]["max"].as_u64().unwrap_or(0),
+            dur_mean_ns: json["duration_ns"]["mean"].as_u64().unwrap_or(0),
+            dur_recent_ns: json["duration_ewma_ns"]["mean"].as_u64().unwrap_or(0),
+            dur_stddev_ns: json["duration_ns"]["stddev"].as_u64().unwrap_or(0),
+            dur_recent_stddev_ns: json["duration_ewma_ns"]["stddev"].as_u64().unwrap_or(0),
+        });
+    }
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+    result
 }
 
 /// Read all blocked_* time stats: returns (name, count, recent_mean_us).
@@ -591,10 +664,32 @@ fn read_reconcile_status(mount_point: &str) -> String {
         })
         .unwrap_or_default();
 
-    if scan_pending == 0 && pending_work == 0 {
-        format!("{state}{progress} — healthy")
+    // Collect non-zero pending categories
+    let mut pending_categories: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() >= 2 && parts[0].ends_with(':') {
+            let name = parts[0].trim_end_matches(':');
+            if ["replicas", "checksum", "erasure_code", "compression", "target", "pending", "stripes"].contains(&name) {
+                let has_nonzero = parts[1..].iter().any(|v| *v != "0");
+                if has_nonzero {
+                    pending_categories.push(format!("{name}:{}", parts[1]));
+                }
+            }
+        }
+    }
+
+    if state == "processing" {
+        if pending_categories.is_empty() {
+            format!("working{progress}")
+        } else {
+            format!("working{progress} — {}", pending_categories.join(" "))
+        }
+    } else if scan_pending > 0 || !pending_categories.is_empty() {
+        format!("idle — pending: {}", pending_categories.join(" "))
     } else {
-        format!("{state}{progress} — scan:{scan_pending} pending:{pending_work}")
+        "idle".into()
     }
 }
 

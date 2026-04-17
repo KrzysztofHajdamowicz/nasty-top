@@ -18,7 +18,7 @@ use std::io;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "nasty-top", about = "Interactive bcachefs tuning workbench")]
+#[command(name = "nasty-top", about = "A top-like TUI for bcachefs filesystems", version)]
 struct Cli {
     /// Filesystem name or UUID to monitor (defaults to first discovered).
     #[arg(long, short)]
@@ -92,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match key.code {
                     KeyCode::Char('q') => app.should_quit = true,
+                    KeyCode::Char('?') => app.show_help = !app.show_help,
                     KeyCode::Char('y') | KeyCode::Char('Y') => app.apply_proposal(),
                     KeyCode::Char('n') | KeyCode::Char('N') => app.dismiss_proposal(),
                     KeyCode::Char('!') => app.dismiss_permanent(),
@@ -100,7 +101,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.show_counters = !app.show_counters;
                         if app.show_counters { app.show_processes = false; app.show_blocked = false; }
                     }
-                    KeyCode::Char('r') => app.toggle_reconcile(),
+                    KeyCode::Char('r') => app.toggle_option("reconcile_enabled"),
+                    KeyCode::Char('g') => app.toggle_option("copygc_enabled"),
                     KeyCode::Char('t') => {
                         app.show_blocked = !app.show_blocked;
                         if app.show_blocked { app.show_processes = false; app.show_counters = false; }

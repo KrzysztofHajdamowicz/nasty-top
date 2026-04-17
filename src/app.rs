@@ -13,6 +13,17 @@ pub struct StallEvent {
     pub detail: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct TimeStatView {
+    pub name: String,
+    pub count_delta: u64,
+    pub count_total: u64,
+    pub mean_ns: u64,
+    pub recent_ns: u64,
+    pub max_ns: u64,
+    pub is_blocked: bool,
+}
+
 /// Which panel has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -52,7 +63,10 @@ pub struct App {
     pub blocked_deltas: Vec<(String, u64, f64)>,
     /// Counter deltas per tick: (name, delta, cumulative).
     pub counter_deltas: Vec<(String, u64, u64)>,
+    /// Time stats with delta count per tick.
+    pub time_stats_view: Vec<TimeStatView>,
     pub show_counters: bool,
+    pub show_help: bool,
     pub verbose_devices: bool,
 }
 
@@ -83,7 +97,9 @@ impl App {
             proposal: None,
             blocked_deltas: Vec::new(),
             counter_deltas: Vec::new(),
+            time_stats_view: Vec::new(),
             show_counters: false,
+            show_help: false,
             dismissed_temp: Vec::new(),
             dismissed_permanent: std::collections::HashSet::new(),
             verbose_devices: false,
@@ -186,6 +202,40 @@ impl App {
             }
         });
 
+        // Compute time_stats view with deltas
+        self.time_stats_view = new_snap.all_time_stats.iter().map(|ts| {
+            let prev_count = self.current.all_time_stats.iter()
+                .find(|p| p.name == ts.name)
+                .map(|p| p.count)
+                .unwrap_or(ts.count);
+            let delta = ts.count.saturating_sub(prev_count);
+            TimeStatView {
+                name: ts.name.clone(),
+                count_delta: delta,
+                count_total: ts.count,
+                mean_ns: ts.dur_mean_ns,
+                recent_ns: ts.dur_recent_ns,
+                max_ns: ts.dur_max_ns,
+                is_blocked: ts.name.starts_with("blocked_"),
+            }
+        }).collect();
+        // Sort: active first by delta desc, blocked first within active, then alphabetical
+        self.time_stats_view.sort_by(|a, b| {
+            match (a.count_delta > 0, b.count_delta > 0) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ if a.count_delta != b.count_delta => b.count_delta.cmp(&a.count_delta),
+                _ => {
+                    // Within same delta, blocked entries first
+                    match (a.is_blocked, b.is_blocked) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => a.name.cmp(&b.name),
+                    }
+                }
+            }
+        });
+
         // Compute counter deltas
         self.counter_deltas = new_snap.counters.iter().map(|(name, &val)| {
             let prev_val = self.current.counters.get(name).copied().unwrap_or(val);
@@ -263,13 +313,13 @@ impl App {
             self.fs.fs_name, self.fs_index + 1, self.all_fs.len()));
     }
 
-    pub fn toggle_reconcile(&mut self) {
-        let current = self.current.options.get("reconcile_enabled")
+    pub fn toggle_option(&mut self, name: &str) {
+        let current = self.current.options.get(name)
             .map(|v| v.trim() == "1")
             .unwrap_or(false);
         let new_val = if current { "0" } else { "1" };
-        match sysfs::write_option(&self.fs, "reconcile_enabled", new_val) {
-            Ok(()) => self.status_msg = Some(format!("reconcile_enabled = {new_val}")),
+        match sysfs::write_option(&self.fs, name, new_val) {
+            Ok(()) => self.status_msg = Some(format!("{name} = {new_val}")),
             Err(e) => self.status_msg = Some(format!("Failed: {e}")),
         }
     }

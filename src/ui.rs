@@ -22,6 +22,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_header(f, app, chunks[0]);
     draw_body(f, app, chunks[1]);
     draw_footer(f, app, chunks[2]);
+
+    if app.show_help {
+        draw_help(f);
+    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -54,7 +58,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let title = format!(
-        " nasty-top │ {} ({}) │ {:.1} GiB / {:.1} GiB ({:.1}%) │ {}x {}{}",
+        " nasty-top v{} │ {} ({}) │ {:.1} GiB / {:.1} GiB ({:.1}%) │ {}x {}{}",
+        env!("CARGO_PKG_VERSION"),
         fs.fs_name, fs.mount_point, used_gb, total_gb, pct, replicas, compression, fs_indicator
     );
 
@@ -93,7 +98,7 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
     let dev_count = if app.show_counters {
         app.counter_deltas.len().min(30).max(10)
     } else if app.show_blocked {
-        app.current.blocked_stats.len().max(5)
+        app.time_stats_view.len().min(30).max(10)
     } else if app.show_processes {
         20
     } else {
@@ -473,6 +478,52 @@ fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
 
 }
 
+fn draw_help(f: &mut Frame) {
+    let area = f.area();
+    let w = 50u16.min(area.width.saturating_sub(4));
+    let h = 22u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let popup = Rect::new(x, y, w, h);
+
+    // Clear background
+    f.render_widget(ratatui::widgets::Clear, popup);
+
+    let block = Block::default()
+        .title(" Help — [?] close ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+
+    let help_text = vec![
+        Line::from(Span::styled("Views", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  c  counters (all sysfs counters)"),
+        Line::from("  t  blocked stats (time_stats)"),
+        Line::from("  p  process IO (top by throughput)"),
+        Line::from("  o  options panel (sysfs editing)"),
+        Line::from("  f  cycle filesystem"),
+        Line::from(""),
+        Line::from(Span::styled("Toggles", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  r  reconcile on/off"),
+        Line::from("  g  copygc on/off"),
+        Line::from(""),
+        Line::from(Span::styled("Options panel", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  Tab    switch focus"),
+        Line::from("  ↑↓    navigate options"),
+        Line::from("  Enter  edit selected option"),
+        Line::from("  Esc    cancel edit"),
+        Line::from(""),
+        Line::from(Span::styled("Advisor", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  Y  apply suggestion"),
+        Line::from("  N  dismiss (2 min)"),
+        Line::from("  !  never suggest again"),
+        Line::from("  C  clear permanent dismissals"),
+    ];
+
+    let para = Paragraph::new(help_text).block(block);
+    f.render_widget(para, popup);
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if let Some(ref proposal) = app.proposal {
         // Show proposal with Y to apply
@@ -491,7 +542,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         let para = Paragraph::new(msg.clone()).style(Style::default().fg(Color::Green));
         f.render_widget(para, area);
     } else {
-        let mut help = String::from("[o] options  [c] counters  [t] blocked  [p] procs  [r] reconcile  [f] fs  [q] quit");
+        let mut help = String::from("[?] help  [o] options  [c] counters  [t] blocked  [p] procs  [r] reconcile  [g] copygc  [f] fs  [q] quit");
         if !app.dismissed_permanent.is_empty() {
             help.push_str(&format!("  ({} suppressed — [C] clear)", app.dismissed_permanent.len()));
         }
@@ -540,52 +591,50 @@ fn draw_counter_table(f: &mut Frame, app: &App, area: Rect, border_style: Style)
 
 fn draw_blocked_table(f: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let block = Block::default()
-        .title(" Blocked Stats (time_stats) — [t] toggle ")
+        .title(" Time Stats — [t] toggle ")
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let header = Row::new(vec!["Blocked On", "+/tick", "Recent Mean", "Status"])
+    let header = Row::new(vec!["Operation", "+/tick", "Count", "Mean", "Recent", "Max"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let rows: Vec<Row> = app.blocked_deltas.iter().map(|(name, delta, recent_us)| {
-        let active = *delta > 0;
-        let style = if active && *recent_us > 10_000.0 {
+    let fmt_ns = |ns: u64| -> String {
+        if ns == 0 { return "—".into(); }
+        if ns >= 1_000_000_000 { format!("{:.1}s", ns as f64 / 1e9) }
+        else if ns >= 1_000_000 { format!("{:.1}ms", ns as f64 / 1e6) }
+        else if ns >= 1_000 { format!("{:.0}µs", ns as f64 / 1e3) }
+        else { format!("{}ns", ns) }
+    };
+
+    let rows: Vec<Row> = app.time_stats_view.iter().map(|ts| {
+        let active = ts.count_delta > 0;
+        let style = if ts.is_blocked && active && ts.recent_ns > 10_000_000 {
             Style::default().fg(Color::Red)
+        } else if ts.is_blocked && active {
+            Style::default().fg(Color::Rgb(255, 165, 0))
         } else if active {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::DarkGray)
         };
 
-        let mean_str = if active {
-            format_duration_us_static(*recent_us)
-        } else {
-            "—".into()
-        };
-
-        let status = if active && *recent_us > 100_000.0 {
-            "STALL"
-        } else if active && *recent_us > 10_000.0 {
-            "slow"
-        } else if active {
-            "ok"
-        } else {
-            ""
-        };
-
         Row::new(vec![
-            Cell::new(name.clone()),
-            Cell::new(if active { format!("+{}", delta) } else { "0".into() }),
-            Cell::new(mean_str),
-            Cell::new(status),
+            Cell::new(ts.name.clone()),
+            Cell::new(if active { format!("+{}", ts.count_delta) } else { "0".into() }),
+            Cell::new(format!("{}", ts.count_total)),
+            Cell::new(fmt_ns(ts.mean_ns)),
+            Cell::new(fmt_ns(ts.recent_ns)),
+            Cell::new(fmt_ns(ts.max_ns)),
         ]).style(style)
     }).collect();
 
     let widths = [
         Constraint::Min(30),
+        Constraint::Length(8),
         Constraint::Length(10),
-        Constraint::Length(12),
-        Constraint::Length(6),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(9),
     ];
     let table = Table::new(rows, widths).header(header).block(block);
     f.render_widget(table, area);
