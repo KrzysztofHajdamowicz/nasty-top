@@ -93,10 +93,6 @@ pub fn discover() -> Vec<BcachefsFs> {
             continue;
         }
         let mount_point = parts[1];
-        // Skip kubelet bind mounts — prefer /fs/ canonical mounts
-        if !mount_point.starts_with("/fs/") {
-            continue;
-        }
         let first_dev = parts[0].split(':').next().unwrap_or("");
         let uuid = read_blkid_uuid(first_dev).unwrap_or_default();
         if uuid.is_empty() || !seen.insert(uuid.clone()) {
