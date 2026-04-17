@@ -159,7 +159,7 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
                     },
                 ]),
                 Line::from(vec![
-                    Span::styled("Jrnl: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Journal: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(format!("{:.0}%", jpct), Style::default().fg(jcolor).add_modifier(Modifier::BOLD)),
                 ]),
             ];

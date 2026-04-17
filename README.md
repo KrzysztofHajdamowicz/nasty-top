@@ -23,6 +23,11 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 
 ## Install
 
+**Nix:**
+```bash
+nix run github:nasty-project/nasty-top
+```
+
 **Homebrew (Linux):**
 ```bash
 brew install fenio/tap/nasty-top
