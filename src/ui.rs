@@ -426,11 +426,6 @@ fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8)])
-        .split(area);
-
     {
         let block = Block::default()
             .title(" Options (Enter to edit) ")
@@ -467,9 +462,9 @@ fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
             })
             .collect();
 
-        let widths = [Constraint::Percentage(55), Constraint::Percentage(45)];
+        let widths = [Constraint::Min(20), Constraint::Length(15)];
         let table = Table::new(rows, widths).block(block);
-        f.render_widget(table, chunks[0]);
+        f.render_widget(table, area);
     }
 
 }

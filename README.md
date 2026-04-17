@@ -4,9 +4,8 @@ A top-like TUI for bcachefs filesystems. Real-time per-device IO, latency, and i
 
 Built for [NASty](https://github.com/nasty-project/nasty) but works on any system with a mounted bcachefs filesystem.
 
-![nasty-top devices view](screen1.jpg)
-![nasty-top blocked stats](screen2.jpg)
-![nasty-top process IO](screen3.jpg)
+![nasty-top blocked stats](screen1.jpg)
+![nasty-top process IO](screen2.jpg)
 
 ## Features
 
@@ -17,7 +16,7 @@ Built for [NASty](https://github.com/nasty-project/nasty) but works on any syste
 - **Stall detection** with 60-second event log when latency exceeds 200ms
 - **Tuning advisor** that analyzes current state and proposes sysfs changes with one-key apply
 - **Options panel** with inline editing of runtime-tunable sysfs options
-- **Configuration markers** for A/B comparison of settings
+- **Multi-filesystem support** — press `f` to cycle between mounted bcachefs filesystems
 - **Process IO view** showing which processes are doing IO
 - **Journal fill %**, load average, reconcile progress
 - **Consistent color scheme**: yellow = read, blue = write, red = errors/stalls
@@ -66,8 +65,7 @@ Options:
 | `Tab` | Switch focus between metrics and options panel |
 | `Enter` | Edit selected option value |
 | `Esc` | Cancel edit |
-| `m` | Save current options as a marker |
-| `1`-`9` | Restore marker |
+| `f` | Cycle between filesystems |
 | `Y` | Apply advisor suggestion |
 | `N` | Dismiss suggestion for 2 minutes |
 | `!` | Permanently dismiss suggestion |
@@ -83,7 +81,6 @@ Options:
 | IO latency (fs) | `time_stats/data_{read,write}` | "recent" column rolling mean |
 | Blocked stats | `time_stats/blocked_*` | Count delta per tick + recent mean |
 | Journal fill | `internal/journal_debug` | dirty/total entries + watermark |
-| Compression | `compression_stats` | compressed vs uncompressed bytes |
 | Reconcile | `bcachefs reconcile status` | Subprocess, parsed for progress |
 | Process IO | `/proc/<pid>/io` | read_bytes/write_bytes diffed |
 | Options | `options/*` | Read/write directly to sysfs |
