@@ -23,6 +23,9 @@ pub struct DeviceInfo {
     pub io_latency_write_ns: u64,
     pub io_done_read: u64,
     pub io_done_write: u64,
+    /// Per-category breakdown: sb, journal, btree, user, etc.
+    pub io_read_by_type: HashMap<String, u64>,
+    pub io_write_by_type: HashMap<String, u64>,
     pub io_errors: u64,
 }
 
@@ -44,11 +47,23 @@ pub struct TimeStat {
 pub struct FsSnapshot {
     pub counters: HashMap<String, u64>,
     pub time_stats: HashMap<String, TimeStat>,
+    /// Key latencies from time_stats "recent" column.
+    pub recent_data_read_us: f64,
+    pub recent_data_write_us: f64,
+    pub recent_btree_read_us: f64,
+    /// Blocked stats: (name, cumulative_count, recent_mean_us).
+    pub blocked_stats: Vec<(String, u64, f64)>,
+    /// Compression: (compressed_bytes, uncompressed_bytes).
+    pub compression: (u64, u64),
     pub devices: Vec<DeviceInfo>,
     pub space_total: u64,
     pub space_used: u64,
     pub options: HashMap<String, String>,
-    pub background: HashMap<String, String>,
+    pub background: Vec<(String, String)>,
+    /// Journal fill: (dirty, total) entries.
+    pub journal_fill: (u64, u64),
+    /// Journal watermark level.
+    pub journal_watermark: String,
 }
 
 /// Discover mounted bcachefs filesystems from /proc/mounts.
@@ -103,9 +118,19 @@ pub fn snapshot(fs: &BcachefsFs) -> FsSnapshot {
     let mut snap = FsSnapshot::default();
     snap.counters = read_counters(&fs.sysfs);
     snap.time_stats = read_time_stats(&fs.sysfs);
+
+    // Extract key recent latencies
+    snap.recent_data_read_us = read_recent_mean_us(&fs.sysfs, "data_read");
+    snap.recent_data_write_us = read_recent_mean_us(&fs.sysfs, "data_write");
+    snap.recent_btree_read_us = read_recent_mean_us(&fs.sysfs, "btree_node_read");
+    snap.blocked_stats = read_blocked_stats(&fs.sysfs);
+    snap.compression = read_compression_stats(&fs.sysfs);
     snap.devices = read_devices(&fs.sysfs);
     snap.options = read_options(&fs.sysfs);
-    snap.background = read_background(&fs.sysfs);
+    snap.background = read_background(&fs.sysfs, &fs.mount_point);
+    let (jf, jw) = read_journal_fill(&fs.sysfs);
+    snap.journal_fill = jf;
+    snap.journal_watermark = jw;
 
     // Space via statvfs
     if let Ok(stat) = nix::sys::statvfs::statvfs(fs.mount_point.as_str()) {
@@ -205,7 +230,7 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
         let read_lat = read_latency_ns(&dev_path, "read");
         let write_lat = read_latency_ns(&dev_path, "write");
 
-        let (io_read, io_write) = read_io_done(&dev_path);
+        let (io_read, io_write, io_read_by_type, io_write_by_type) = read_io_done(&dev_path);
         let io_errors = read_io_errors(&dev_path);
 
         devices.push(DeviceInfo {
@@ -216,6 +241,8 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
             io_latency_write_ns: write_lat,
             io_done_read: io_read,
             io_done_write: io_write,
+            io_read_by_type,
+            io_write_by_type,
             io_errors,
         });
     }
@@ -223,38 +250,50 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
     devices
 }
 
+/// Read per-device recent (EWMA) latency from io_latency_stats_{direction}_json.
+/// Falls back to the cumulative io_latency_{direction} if JSON isn't available.
 fn read_latency_ns(dev_path: &Path, direction: &str) -> u64 {
-    let path = dev_path.join(format!("io_latency_{direction}"));
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    // Format: "quantiles (ns):\n  mean: 12345\n" or just a number
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(val) = trimmed.strip_prefix("mean:").or_else(|| trimmed.strip_prefix("avg:")) {
-            return val.trim().split_whitespace().next()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-        }
-    }
-    content.trim().parse().unwrap_or(0)
-}
-
-fn read_io_done(dev_path: &Path) -> (u64, u64) {
-    let path = dev_path.join("io_done");
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    let mut read_total = 0u64;
-    let mut write_total = 0u64;
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 {
-            let val: u64 = parts.last().and_then(|v| v.parse().ok()).unwrap_or(0);
-            if line.contains("read") {
-                read_total += val;
-            } else if line.contains("write") {
-                write_total += val;
+    // Prefer the EWMA from the JSON stats — this is actual recent latency
+    let json_path = dev_path.join(format!("io_latency_stats_{direction}_json"));
+    if let Ok(content) = std::fs::read_to_string(&json_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(ewma) = json["duration_ewma_ns"]["mean"].as_u64() {
+                return ewma;
             }
         }
     }
-    (read_total, write_total)
+    // Fallback: cumulative mean (not great but better than nothing)
+    let path = dev_path.join(format!("io_latency_{direction}"));
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// io_done is JSON: {"read": {"sb": N, "user": N, ...}, "write": {...}}
+/// Values are bytes. Returns (total_read, total_write, read_by_type, write_by_type).
+fn read_io_done(dev_path: &Path) -> (u64, u64, HashMap<String, u64>, HashMap<String, u64>) {
+    let path = dev_path.join("io_done");
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
+
+    let parse_obj = |obj: &serde_json::Value| -> HashMap<String, u64> {
+        obj.as_object()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_u64().map(|val| (k.clone(), val)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let read_map = parse_obj(&json["read"]);
+    let write_map = parse_obj(&json["write"]);
+    let read_total: u64 = read_map.values().sum();
+    let write_total: u64 = write_map.values().sum();
+
+    (read_total, write_total, read_map, write_map)
 }
 
 fn read_io_errors(dev_path: &Path) -> u64 {
@@ -285,27 +324,46 @@ fn read_options(sysfs: &Path) -> HashMap<String, String> {
     map
 }
 
-fn read_background(sysfs: &Path) -> HashMap<String, String> {
+fn read_background(sysfs: &Path, mount_point: &str) -> Vec<(String, String)> {
     let dir = sysfs.join("internal");
-    let mut map = HashMap::new();
-    for name in ["rebalance_status", "copygc_status", "journal_debug"] {
-        let path = dir.join(name);
-        if let Ok(val) = std::fs::read_to_string(&path) {
-            map.insert(name.to_string(), val.trim().to_string());
+    let opts = sysfs.join("options");
+    // Fixed order for stable rendering
+    let mut result = Vec::new();
+
+    // Reconcile status (replication health)
+    result.push(("reconcile".to_string(), read_reconcile_status(mount_point)));
+
+    // Only show background ops that actually have a sysfs toggle
+    for prefix in ["rebalance", "copygc"] {
+        let enabled_path = opts.join(format!("{prefix}_enabled"));
+        let status_path = dir.join(format!("{prefix}_status"));
+
+        // Skip if the option doesn't exist on this kernel
+        if !enabled_path.exists() {
+            continue;
         }
+
+        let enabled = std::fs::read_to_string(&enabled_path)
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+
+        let status = std::fs::read_to_string(&status_path)
+            .unwrap_or_else(|_| "n/a".into())
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("n/a")
+            .to_string();
+
+        let display = if enabled {
+            format!("on — {status}")
+        } else {
+            "off".into()
+        };
+
+        result.push((prefix.to_string(), display));
     }
-    // Also try top-level trigger files
-    for name in [
-        "rebalance_enabled",
-        "copygc_enabled",
-        "gc_gens_pos",
-    ] {
-        let path = sysfs.join("options").join(name);
-        if let Ok(val) = std::fs::read_to_string(&path) {
-            map.insert(name.to_string(), val.trim().to_string());
-        }
-    }
-    map
+    result
 }
 
 pub fn read_file_string(path: &Path) -> Option<String> {
@@ -313,6 +371,271 @@ pub fn read_file_string(path: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Parse the "recent" mean from a time_stats file.
+/// Format: "  mean:    12 ms    762 us" — we want the second value.
+fn read_recent_mean_us(sysfs: &Path, stat_name: &str) -> f64 {
+    let path = sysfs.join("time_stats").join(stat_name);
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+
+    // Find the "mean:" line under "duration of events"
+    let mut in_duration = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("duration of events") {
+            in_duration = true;
+            continue;
+        }
+        if trimmed.starts_with("time between events") {
+            break;
+        }
+        if in_duration && trimmed.starts_with("mean:") {
+            // "mean:    12 ms    762 us"
+            // Split by whitespace, take last two tokens (value + unit) as "recent"
+            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            // tokens: ["mean:", "12", "ms", "762", "us"]
+            // Recent is the last value+unit pair
+            if tokens.len() >= 4 {
+                let val: f64 = tokens[tokens.len() - 2].parse().unwrap_or(0.0);
+                let unit = tokens[tokens.len() - 1];
+                return to_microseconds(val, unit);
+            }
+        }
+    }
+    0.0
+}
+
+fn to_microseconds(val: f64, unit: &str) -> f64 {
+    match unit {
+        "ns" => val / 1000.0,
+        "us" => val,
+        "ms" => val * 1000.0,
+        "s" => val * 1_000_000.0,
+        "m" => val * 60_000_000.0,
+        "h" => val * 3_600_000_000.0,
+        _ => val,
+    }
+}
+
+/// Read all blocked_* time stats: returns (name, count, recent_mean_us).
+fn read_blocked_stats(sysfs: &Path) -> Vec<(String, u64, f64)> {
+    let dir = sysfs.join("time_stats");
+    let mut result = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("blocked_") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(entry.path()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut count = 0u64;
+        let mut recent_mean_us = 0.0f64;
+        let mut in_duration = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("count:") {
+                count = trimmed.split_whitespace().nth(1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
+            if trimmed.starts_with("duration of events") {
+                in_duration = true;
+                continue;
+            }
+            if trimmed.starts_with("time between events") {
+                in_duration = false;
+            }
+            if in_duration && trimmed.starts_with("mean:") {
+                let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                if tokens.len() >= 4 {
+                    let val: f64 = tokens[tokens.len() - 2].parse().unwrap_or(0.0);
+                    let unit = tokens[tokens.len() - 1];
+                    recent_mean_us = to_microseconds(val, unit);
+                }
+            }
+        }
+        let short_name = name.strip_prefix("blocked_").unwrap_or(&name).to_string();
+        result.push((short_name, count, recent_mean_us));
+    }
+    // Sort: non-zero counts first (by count desc), then alphabetical
+    result.sort_by(|a, b| {
+        let a_active = a.1 > 0;
+        let b_active = b.1 > 0;
+        match (a_active, b_active) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => b.1.cmp(&a.1).then(a.0.cmp(&b.0)),
+        }
+    });
+    result
+}
+
+/// Read compression stats from compression_stats sysfs file.
+/// Returns (compressed_bytes, uncompressed_bytes).
+fn read_compression_stats(sysfs: &Path) -> (u64, u64) {
+    let path = sysfs.join("compression_stats");
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut compressed = 0u64;
+    let mut uncompressed = 0u64;
+    for line in content.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        // Format: "zstd    54.5G    58.1G    490k"
+        //         "incompressible  224G  224G  212k"
+        if tokens.len() >= 3 && tokens[0] != "typetype" {
+            compressed += parse_size(tokens[1]);
+            uncompressed += parse_size(tokens[2]);
+        }
+    }
+    (compressed, uncompressed)
+}
+
+fn parse_size(s: &str) -> u64 {
+    let s = s.trim();
+    if s == "0" { return 0; }
+    let (num_str, mult) = if let Some(n) = s.strip_suffix('k') {
+        (n, 1_000u64)
+    } else if let Some(n) = s.strip_suffix('M') {
+        (n, 1_000_000)
+    } else if let Some(n) = s.strip_suffix('G') {
+        (n, 1_000_000_000)
+    } else if let Some(n) = s.strip_suffix('T') {
+        (n, 1_000_000_000_000)
+    } else {
+        (s, 1)
+    };
+    let val: f64 = num_str.parse().unwrap_or(0.0);
+    (val * mult as f64) as u64
+}
+
+/// Read journal fill from internal/journal_debug.
+fn read_journal_fill(sysfs: &Path) -> ((u64, u64), String) {
+    let path = sysfs.join("internal").join("journal_debug");
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut dirty = 0u64;
+    let mut total = 1u64;
+    let mut watermark = String::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(val) = trimmed.strip_prefix("dirty journal entries:") {
+            // Format: "187/32768"
+            let val = val.trim();
+            let parts: Vec<&str> = val.split('/').collect();
+            if parts.len() == 2 {
+                dirty = parts[0].trim().parse().unwrap_or(0);
+                total = parts[1].trim().parse().unwrap_or(1).max(1);
+            }
+        } else if let Some(val) = trimmed.strip_prefix("watermark:") {
+            watermark = val.trim().to_string();
+        }
+    }
+    ((dirty, total), watermark)
+}
+
+/// Parse `bcachefs reconcile status <mount>` into a one-line summary.
+fn read_reconcile_status(mount_point: &str) -> String {
+    let output = match std::process::Command::new("bcachefs")
+        .args(["reconcile", "status", mount_point])
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => return "n/a".into(),
+    };
+
+    // Check scan pending
+    let scan_pending: u64 = output
+        .lines()
+        .find(|l| l.contains("Scan pending"))
+        .and_then(|l| l.split_whitespace().last())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    // Sum all non-zero "pending:" row values
+    let pending_work: u64 = output
+        .lines()
+        .filter(|l| l.trim().starts_with("pending:"))
+        .flat_map(|l| l.split_whitespace().skip(1))
+        .filter_map(|v| v.parse::<u64>().ok())
+        .sum();
+
+    // Detect state from the output
+    let state = if output.contains("processing") {
+        "processing"
+    } else if output.contains("running") {
+        "running"
+    } else if output.contains("waiting") {
+        "idle"
+    } else {
+        "unrecognized"
+    };
+
+    // Extract progress percentage if processing
+    let progress = output.lines()
+        .find(|l| l.contains('%'))
+        .and_then(|l| {
+            l.split('%').next()
+                .and_then(|s| s.split_whitespace().last())
+                .map(|s| format!(" {s}%"))
+        })
+        .unwrap_or_default();
+
+    if scan_pending == 0 && pending_work == 0 {
+        format!("{state}{progress} — healthy")
+    } else {
+        format!("{state}{progress} — scan:{scan_pending} pending:{pending_work}")
+    }
+}
+
+/// Per-process I/O snapshot from /proc/<pid>/io.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessIo {
+    pub pid: u32,
+    pub name: String,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+}
+
+/// Read I/O stats for all processes.
+pub fn read_all_process_io() -> Vec<ProcessIo> {
+    let mut result = Vec::new();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let pid: u32 = match name_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let io_path = format!("/proc/{pid}/io");
+        let content = match std::fs::read_to_string(&io_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut read_bytes = 0u64;
+        let mut write_bytes = 0u64;
+        for line in content.lines() {
+            if let Some(val) = line.strip_prefix("read_bytes: ") {
+                read_bytes = val.trim().parse().unwrap_or(0);
+            } else if let Some(val) = line.strip_prefix("write_bytes: ") {
+                write_bytes = val.trim().parse().unwrap_or(0);
+            }
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        result.push(ProcessIo { pid, name: comm, read_bytes, write_bytes });
+    }
+    result
 }
 
 /// Write a value to a sysfs option file. Returns Ok(()) on success.

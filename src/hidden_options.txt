@@ -1,0 +1,35 @@
+# Options hidden from the tuning panel.
+# These are unlikely to be useful for performance tuning.
+# The full list of all options is still readable via sysfs directly.
+acl
+fsck
+fsck_memory_usage_percent
+data_replicas
+casefold
+casefold_disabled
+background_target
+foreground_target
+metadata_target
+grpquota
+degraded
+data_checksum
+errors
+metadata_checksum
+promote_target
+dangerously_reconstruct_alloc
+recovery_pass_last
+reconcile_on_ac_only
+inodes_32bit
+nochanges
+noexcl
+nocow_enabled
+no_splitbrain_check
+fix_errors
+prjquota
+usrquota
+str_hash
+recovery_passes
+recovery_passes_exclude
+scrub_recent_journal_entries
+version_upgrade
+wide_macs

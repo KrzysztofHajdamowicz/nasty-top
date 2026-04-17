@@ -1,3 +1,4 @@
+mod advisor;
 mod app;
 mod metrics;
 mod sysfs;
@@ -24,7 +25,7 @@ struct Cli {
     filesystem: Option<String>,
 
     /// Refresh interval in seconds.
-    #[arg(long, short = 't', default_value = "1")]
+    #[arg(long, short = 't', default_value = "2")]
     interval: f64,
 }
 
@@ -89,6 +90,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match key.code {
                     KeyCode::Char('q') => app.should_quit = true,
+                    KeyCode::Char('y') | KeyCode::Char('Y') => app.apply_proposal(),
+                    KeyCode::Char('n') | KeyCode::Char('N') => app.dismiss_proposal(),
+                    KeyCode::Char('!') => app.dismiss_permanent(),
+                    KeyCode::Char('C') => app.clear_dismissals(),
+                    KeyCode::Char('t') => {
+                        app.show_blocked = !app.show_blocked;
+                        if app.show_blocked { app.show_processes = false; }
+                    }
+                    KeyCode::Char('p') => {
+                        app.show_processes = !app.show_processes;
+                        if app.show_processes {
+                            app.show_blocked = false;
+                            // Reset baseline so first tick shows rates
+                            app.prev_proc_io = sysfs::read_all_process_io();
+                        }
+                    }
+                    KeyCode::Char('o') => {
+                        app.show_options = !app.show_options;
+                        if !app.show_options {
+                            app.focus = app::Focus::Metrics;
+                        }
+                    }
                     KeyCode::Tab => app.toggle_focus(),
                     KeyCode::Up | KeyCode::Char('k') => {
                         if matches!(app.focus, app::Focus::Tuning) {

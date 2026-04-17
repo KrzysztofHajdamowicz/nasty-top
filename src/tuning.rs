@@ -1,7 +1,18 @@
 //! Tuning panel state — sysfs option editing and marker snapshots.
 
 use crate::sysfs::{self, BcachefsFs};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Options excluded from the tuning panel (see hidden_options.txt).
+const HIDDEN_OPTIONS: &str = include_str!("hidden_options.txt");
+
+fn hidden_set() -> HashSet<&'static str> {
+    HIDDEN_OPTIONS
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
 
 /// A saved configuration snapshot (marker).
 #[derive(Debug, Clone)]
@@ -26,7 +37,12 @@ pub struct TuningState {
 
 impl TuningState {
     pub fn new(options: &HashMap<String, String>) -> Self {
-        let mut option_names: Vec<String> = options.keys().cloned().collect();
+        let hidden = hidden_set();
+        let mut option_names: Vec<String> = options
+            .keys()
+            .filter(|k| !hidden.contains(k.as_str()))
+            .cloned()
+            .collect();
         option_names.sort();
         Self {
             option_names,
@@ -38,7 +54,12 @@ impl TuningState {
     }
 
     pub fn refresh_names(&mut self, options: &HashMap<String, String>) {
-        let mut names: Vec<String> = options.keys().cloned().collect();
+        let hidden = hidden_set();
+        let mut names: Vec<String> = options
+            .keys()
+            .filter(|k| !hidden.contains(k.as_str()))
+            .cloned()
+            .collect();
         names.sort();
         self.option_names = names;
         if self.selected >= self.option_names.len() && !self.option_names.is_empty() {
