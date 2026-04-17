@@ -72,26 +72,6 @@ Options:
 | `C` | Clear all permanent dismissals |
 | `q` | Quit |
 
-## Layout
-
-```
-+----------+-------------- READ ---------------+------------- WRITE ---------------+
-| System   | throughput sparkline               | throughput sparkline               |
-| load avg | latency sparkline                  | latency sparkline                 |
-| journal  |                                    |                                   |
-| compr    |                                    |                                   |
-+----------+------------------------------------+-----------------------------------+
-| Devices  |          READ                      |          WRITE                    |
-| dev  err | user/s btree/s jrnl/s sb/s tot lat | user/s btree/s jrnl/s sb/s tot lat|
-| sda  0   | ...                                | ...                               |
-| TOTAL 0  | ...                                | ...                               |
-+----------+------------------------------------+-----------------------------------+
-| Background                                                                        |
-| reconcile: processing 42% -- healthy                                              |
-| copygc: off                                                                       |
-+----------------------------------------------------------------------------------+
-```
-
 ## Data Sources
 
 | Metric | Source | Notes |
