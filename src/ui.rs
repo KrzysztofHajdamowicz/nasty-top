@@ -94,6 +94,11 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
+    let has_labels = app.rates.as_ref()
+        .map(|r| r.devices.iter().any(|d| d.label.is_some()))
+        .unwrap_or(false);
+    let left_col_width: u16 = if has_labels { 25 } else { 17 };
+
     // Table height: header + rows + total/padding + 2 borders
     let dev_count = if app.show_counters {
         app.counter_deltas.len().min(30).max(10)
@@ -120,9 +125,9 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
         let spark_cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(13),     // info panel
-                Constraint::Percentage(50), // READ sparklines
-                Constraint::Percentage(50), // WRITE sparklines
+                Constraint::Length(left_col_width),
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
             ])
             .split(chunks[0]);
 
@@ -145,14 +150,17 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
                 Line::from(vec![Span::raw(format!(" 5m  {}", load.1))]),
                 Line::from(vec![Span::raw(format!("15m  {}", load.2))]),
                 Line::from(""),
-                Line::from(Span::styled("Journal:", Style::default().fg(Color::DarkGray))),
                 Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(format!("{:.0}%", jpct), Style::default().fg(jcolor).add_modifier(Modifier::BOLD)),
+                    Span::styled("IOWait:", Style::default().fg(Color::DarkGray)),
+                    {
+                        let iow = app.iowait_pct;
+                        let color = if iow > 50.0 { Color::Red } else if iow > 20.0 { Color::Yellow } else { Color::Green };
+                        Span::styled(format!(" {:.0}%", iow), Style::default().fg(color))
+                    },
                 ]),
                 Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(app.current.journal_watermark.clone(), Style::default().fg(Color::DarkGray)),
+                    Span::styled("Jrnl: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{:.0}%", jpct), Style::default().fg(jcolor).add_modifier(Modifier::BOLD)),
                 ]),
             ];
             let para = Paragraph::new(lines).block(block);
@@ -175,9 +183,12 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
 
             let tp_data = sparkline_u64(app.history.get("io_read_bytes_sec"));
             let tp_rate = app.history.get("io_read_bytes_sec").last().copied().unwrap_or(0.0);
+            let tp_iops = app.history.get("io_read_iops").last().copied().unwrap_or(0.0);
+            let avg = if tp_iops > 0.0 && tp_rate > 0.0 { format_bytes_short(tp_rate / tp_iops) } else { "0B".into() };
+            let tp_title = format!("{}/s · {:.0} io/s · avg {avg}", format_bytes(tp_rate), tp_iops);
             let tp_spark = Sparkline::default()
                 .block(Block::default().title(
-                    Span::styled(format!("{}/s", format_bytes(tp_rate)), Style::default().fg(Color::Yellow))
+                    Span::styled(tp_title, Style::default().fg(Color::Yellow))
                 ))
                 .data(&tp_data)
                 .style(Style::default().fg(Color::Yellow));
@@ -210,9 +221,12 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
 
             let tp_data = sparkline_u64(app.history.get("io_write_bytes_sec"));
             let tp_rate = app.history.get("io_write_bytes_sec").last().copied().unwrap_or(0.0);
+            let tp_iops = app.history.get("io_write_iops").last().copied().unwrap_or(0.0);
+            let avg = if tp_iops > 0.0 && tp_rate > 0.0 { format_bytes_short(tp_rate / tp_iops) } else { "0B".into() };
+            let tp_title = format!("{}/s · {:.0} io/s · avg {avg}", format_bytes(tp_rate), tp_iops);
             let tp_spark = Sparkline::default()
                 .block(Block::default().title(
-                    Span::styled(format!("{}/s", format_bytes(tp_rate)), Style::default().fg(Color::Blue))
+                    Span::styled(tp_title, Style::default().fg(Color::Blue))
                 ))
                 .data(&tp_data)
                 .style(Style::default().fg(Color::Blue));
@@ -243,9 +257,9 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
         let dev_cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(13),     // device + err
-                Constraint::Percentage(50), // READ
-                Constraint::Percentage(50), // WRITE
+                Constraint::Length(left_col_width),
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
             ])
             .split(chunks[1]);
 
@@ -256,6 +270,7 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
 
         struct DevData {
             name: String,
+            label: Option<String>,
             rv: Vec<f64>,
             wv: Vec<f64>,
             read_total: f64,
@@ -265,6 +280,7 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
             read_active: bool,
             write_active: bool,
             errors: u64,
+            util_pct: f64,
         }
         let mut devs: Vec<DevData> = Vec::new();
 
@@ -279,11 +295,11 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
                 sw[4] += d.write_bytes_sec;
                 sum_errs += d.io_errors;
                 devs.push(DevData {
-                    name: d.name.clone(), rv, wv,
+                    name: d.name.clone(), label: d.label.clone(), rv, wv,
                     read_total: d.read_bytes_sec, write_total: d.write_bytes_sec,
                     read_lat: d.read_latency_ns, write_lat: d.write_latency_ns,
                     read_active: d.read_active, write_active: d.write_active,
-                    errors: d.io_errors,
+                    errors: d.io_errors, util_pct: d.util_pct,
                 });
             }
         }
@@ -294,20 +310,52 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
                 .title(" Devices ")
                 .borders(Borders::ALL)
                 .border_style(focus_style);
-            let header = Row::new(vec!["Device", "Err"])
-                .style(Style::default().add_modifier(Modifier::BOLD));
+            let has_labels = devs.iter().any(|d| d.label.is_some());
+            let header = if has_labels {
+                Row::new(vec!["Device", "Label", "Err", "Utl"])
+            } else {
+                Row::new(vec!["Device", "Err", "Utl"])
+            }.style(Style::default().add_modifier(Modifier::BOLD));
+
             let mut rows: Vec<Row> = devs.iter().map(|d| {
                 let es = if d.errors > 0 { Style::default().fg(Color::Red) } else { Style::default() };
-                Row::new(vec![
-                    Cell::new(d.name.clone()),
-                    Cell::new(format!("{}", d.errors)).style(es),
-                ])
+                let uc = if d.util_pct > 80.0 { Color::Red } else if d.util_pct > 50.0 { Color::Yellow } else { Color::Green };
+                let util_s = if d.util_pct > 0.0 { format!("{:.0}%", d.util_pct) } else { "—".into() };
+                if has_labels {
+                    Row::new(vec![
+                        Cell::new(d.name.clone()),
+                        Cell::new(d.label.clone().unwrap_or_default()).style(Style::default().fg(Color::DarkGray)),
+                        Cell::new(format!("{}", d.errors)).style(es),
+                        Cell::new(util_s).style(Style::default().fg(uc)),
+                    ])
+                } else {
+                    Row::new(vec![
+                        Cell::new(d.name.clone()),
+                        Cell::new(format!("{}", d.errors)).style(es),
+                        Cell::new(util_s).style(Style::default().fg(uc)),
+                    ])
+                }
             }).collect();
-            rows.push(Row::new(vec![
-                Cell::new("TOTAL").style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
-                Cell::new(format!("{}", sum_errs)).style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
-            ]));
-            let widths = [Constraint::Length(7), Constraint::Length(4)];
+            let total_style = Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan);
+            if has_labels {
+                rows.push(Row::new(vec![
+                    Cell::new("TOTAL").style(total_style),
+                    Cell::new(""),
+                    Cell::new(format!("{}", sum_errs)).style(total_style),
+                    Cell::new(""),
+                ]));
+            } else {
+                rows.push(Row::new(vec![
+                    Cell::new("TOTAL").style(total_style),
+                    Cell::new(format!("{}", sum_errs)).style(total_style),
+                    Cell::new(""),
+                ]));
+            }
+            let widths = if has_labels {
+                vec![Constraint::Length(7), Constraint::Length(6), Constraint::Length(4), Constraint::Length(4)]
+            } else {
+                vec![Constraint::Length(7), Constraint::Length(4), Constraint::Length(4)]
+            };
             let table = Table::new(rows, widths).header(header).block(block);
             f.render_widget(table, dev_cols[0]);
         }
@@ -563,7 +611,7 @@ fn draw_counter_table(f: &mut Frame, app: &App, area: Rect, border_style: Style)
         .style(Style::default().add_modifier(Modifier::BOLD));
 
     let interval = 2.0_f64; // tick interval
-    let rows: Vec<Row> = app.counter_deltas.iter().map(|(name, delta, total)| {
+    let rows: Vec<Row> = app.counter_deltas.iter().skip(app.view_scroll).map(|(name, delta, total)| {
         let active = *delta > 0;
         let style = if active {
             Style::default().fg(Color::Yellow)
@@ -606,7 +654,7 @@ fn draw_blocked_table(f: &mut Frame, app: &App, area: Rect, border_style: Style)
         else { format!("{}ns", ns) }
     };
 
-    let rows: Vec<Row> = app.time_stats_view.iter().map(|ts| {
+    let rows: Vec<Row> = app.time_stats_view.iter().skip(app.view_scroll).map(|ts| {
         let active = ts.count_delta > 0;
         let style = if ts.is_blocked && active && ts.recent_ns > 10_000_000 {
             Style::default().fg(Color::Red)
@@ -646,25 +694,28 @@ fn draw_process_table(f: &mut Frame, app: &App, area: Rect, border_style: Style)
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let header = Row::new(vec!["PID", "Process", "Read/s", "Write/s", "Total/s"])
+    let header = Row::new(vec!["PID", "Process", "Read/s", "Write/s", "Rate", "Total"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let rows: Vec<Row> = app.process_rates.iter().map(|p| {
-        let total = p.read_bytes_sec + p.write_bytes_sec;
-        let active = total > 0.0;
+    let rows: Vec<Row> = app.process_rates.iter().skip(app.view_scroll).map(|p| {
+        let rate = p.read_bytes_sec + p.write_bytes_sec;
+        let cumulative = p.total_read + p.total_write;
+        let active = rate > 0.0;
         let dim = Style::default().fg(Color::DarkGray);
         Row::new(vec![
             Cell::new(format!("{}", p.pid)).style(if active { Style::default() } else { dim }),
             Cell::new(p.name.clone()).style(if active { Style::default() } else { dim }),
             Cell::new(format_bytes(p.read_bytes_sec)).style(if active { Style::default().fg(Color::Yellow) } else { dim }),
             Cell::new(format_bytes(p.write_bytes_sec)).style(if active { Style::default().fg(Color::Blue) } else { dim }),
-            Cell::new(format_bytes(total)).style(if active { Style::default() } else { dim }),
+            Cell::new(format_bytes(rate)).style(if active { Style::default() } else { dim }),
+            Cell::new(format_bytes(cumulative as f64)).style(Style::default().fg(Color::DarkGray)),
         ])
     }).collect();
 
     let widths = [
         Constraint::Length(8),
         Constraint::Min(15),
+        Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(10),

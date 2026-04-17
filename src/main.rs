@@ -100,18 +100,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('c') => {
                         app.show_counters = !app.show_counters;
                         if app.show_counters { app.show_processes = false; app.show_blocked = false; }
+                        app.view_scroll = 0;
                     }
                     KeyCode::Char('r') => app.toggle_option("reconcile_enabled"),
                     KeyCode::Char('g') => app.toggle_option("copygc_enabled"),
                     KeyCode::Char('t') => {
                         app.show_blocked = !app.show_blocked;
                         if app.show_blocked { app.show_processes = false; app.show_counters = false; }
+                        app.view_scroll = 0;
                     }
                     KeyCode::Char('p') => {
                         app.show_processes = !app.show_processes;
                         if app.show_processes {
                             app.show_blocked = false;
                             app.show_counters = false;
+                            app.view_scroll = 0;
                             // Reset baseline so first tick shows rates
                             app.prev_proc_io = sysfs::read_all_process_io();
                         }
@@ -126,11 +129,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Up | KeyCode::Char('k') => {
                         if matches!(app.focus, app::Focus::Tuning) {
                             app.tuning.scroll_up();
+                        } else if app.show_counters || app.show_blocked || app.show_processes {
+                            app.view_scroll = app.view_scroll.saturating_sub(1);
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         if matches!(app.focus, app::Focus::Tuning) {
                             app.tuning.scroll_down();
+                        } else if app.show_counters || app.show_blocked || app.show_processes {
+                            app.view_scroll += 1;
                         }
                     }
                     KeyCode::Enter => app.handle_enter(),

@@ -65,8 +65,12 @@ pub struct App {
     pub counter_deltas: Vec<(String, u64, u64)>,
     /// Time stats with delta count per tick.
     pub time_stats_view: Vec<TimeStatView>,
+    /// CPU iowait % (computed from delta between ticks).
+    pub iowait_pct: f64,
     pub show_counters: bool,
     pub show_help: bool,
+    /// Scroll offset for counter/time stats/process views.
+    pub view_scroll: usize,
     pub verbose_devices: bool,
 }
 
@@ -98,8 +102,10 @@ impl App {
             blocked_deltas: Vec::new(),
             counter_deltas: Vec::new(),
             time_stats_view: Vec::new(),
+            iowait_pct: 0.0,
             show_counters: false,
             show_help: false,
+            view_scroll: 0,
             dismissed_temp: Vec::new(),
             dismissed_permanent: std::collections::HashSet::new(),
             verbose_devices: false,
@@ -122,6 +128,17 @@ impl App {
         let total_write: f64 = rates.devices.iter().map(|d| d.write_bytes_sec).sum();
         self.history.push("io_read_bytes_sec", total_read);
         self.history.push("io_write_bytes_sec", total_write);
+
+        // CPU iowait %
+        let iowait_delta = new_snap.cpu_iowait.saturating_sub(self.current.cpu_iowait) as f64;
+        let cpu_total_delta = new_snap.cpu_total.saturating_sub(self.current.cpu_total) as f64;
+        self.iowait_pct = if cpu_total_delta > 0.0 { iowait_delta / cpu_total_delta * 100.0 } else { 0.0 };
+
+        // IOPS totals for sparkline titles
+        let total_read_iops: f64 = rates.devices.iter().map(|d| d.read_iops).sum();
+        let total_write_iops: f64 = rates.devices.iter().map(|d| d.write_iops).sum();
+        self.history.push("io_read_iops", total_read_iops);
+        self.history.push("io_write_iops", total_write_iops);
 
         // Latency sparkline: use time_stats "recent" mean, but only when
         // there's actual IO — the EWMA doesn't decay when idle.

@@ -27,6 +27,12 @@ pub struct DeviceInfo {
     pub io_read_by_type: HashMap<String, u64>,
     pub io_write_by_type: HashMap<String, u64>,
     pub io_errors: u64,
+    /// Time spent doing IO in milliseconds (from /proc/diskstats field 13).
+    pub diskstats_io_ms: u64,
+    /// Completed read ops (from /proc/diskstats).
+    pub diskstats_reads: u64,
+    /// Completed write ops (from /proc/diskstats).
+    pub diskstats_writes: u64,
 }
 
 /// Time stat entry from time_stats_json.
@@ -75,6 +81,10 @@ pub struct FsSnapshot {
     pub space_used: u64,
     pub options: HashMap<String, String>,
     pub background: Vec<(String, String)>,
+    /// CPU iowait jiffies (from /proc/stat).
+    pub cpu_iowait: u64,
+    /// Total CPU jiffies (for computing iowait %).
+    pub cpu_total: u64,
     /// Journal fill: (dirty, total) entries.
     pub journal_fill: (u64, u64),
     /// Journal watermark level.
@@ -152,6 +162,9 @@ pub fn snapshot(fs: &BcachefsFs) -> FsSnapshot {
     snap.recent_data_read_us = read_recent_mean_us(&fs.sysfs, "data_read");
     snap.recent_data_write_us = read_recent_mean_us(&fs.sysfs, "data_write");
     snap.recent_btree_read_us = read_recent_mean_us(&fs.sysfs, "btree_node_read");
+    let (iowait, cpu_total) = read_cpu_iowait();
+    snap.cpu_iowait = iowait;
+    snap.cpu_total = cpu_total;
     snap.blocked_stats = read_blocked_stats(&fs.sysfs);
     snap.compression = read_compression_stats(&fs.sysfs);
     snap.all_time_stats = read_all_time_stats_json(&fs.sysfs);
@@ -268,6 +281,7 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
 
         let (io_read, io_write, io_read_by_type, io_write_by_type) = read_io_done(&dev_path);
         let io_errors = read_io_errors(&dev_path);
+        let (ds_reads, ds_writes, ds_io_ms) = read_diskstats_for(&dev_name);
 
         devices.push(DeviceInfo {
             index,
@@ -280,6 +294,9 @@ fn read_devices(sysfs: &Path) -> Vec<DeviceInfo> {
             io_read_by_type,
             io_write_by_type,
             io_errors,
+            diskstats_io_ms: ds_io_ms,
+            diskstats_reads: ds_reads,
+            diskstats_writes: ds_writes,
         });
     }
     devices.sort_by_key(|d| d.index);
@@ -427,6 +444,38 @@ pub fn read_file_string(path: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Read per-device stats from /proc/diskstats: (reads_completed, writes_completed, io_ms).
+fn read_diskstats_for(dev_name: &str) -> (u64, u64, u64) {
+    let content = std::fs::read_to_string("/proc/diskstats").unwrap_or_default();
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 14 && fields[2] == dev_name {
+            let reads: u64 = fields[3].parse().unwrap_or(0);
+            let writes: u64 = fields[7].parse().unwrap_or(0);
+            let io_ms: u64 = fields[12].parse().unwrap_or(0);
+            return (reads, writes, io_ms);
+        }
+    }
+    (0, 0, 0)
+}
+
+/// Read CPU iowait from /proc/stat. Returns (iowait_jiffies, total_jiffies).
+fn read_cpu_iowait() -> (u64, u64) {
+    let content = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+    if let Some(line) = content.lines().find(|l| l.starts_with("cpu ")) {
+        let fields: Vec<u64> = line.split_whitespace().skip(1)
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        // fields: user, nice, system, idle, iowait, irq, softirq, steal...
+        if fields.len() >= 5 {
+            let iowait = fields[4];
+            let total: u64 = fields.iter().sum();
+            return (iowait, total);
+        }
+    }
+    (0, 0)
 }
 
 /// Parse the "recent" mean from a time_stats file.

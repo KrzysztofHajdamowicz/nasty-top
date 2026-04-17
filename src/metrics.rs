@@ -28,6 +28,9 @@ pub struct DeviceRate {
     pub write_latency_ns: u64,
     pub read_active: bool,
     pub write_active: bool,
+    pub read_iops: f64,
+    pub write_iops: f64,
+    pub util_pct: f64,
     pub io_errors: u64,
 }
 
@@ -102,6 +105,12 @@ pub fn compute_rates(prev: &FsSnapshot, curr: &FsSnapshot, dt: f64) -> Rates {
             write_bytes_sec: write_delta as f64 / dt,
             read_active: read_delta > 0,
             write_active: write_delta > 0,
+            read_iops: curr_dev.diskstats_reads.saturating_sub(prev_dev.diskstats_reads) as f64 / dt,
+            write_iops: curr_dev.diskstats_writes.saturating_sub(prev_dev.diskstats_writes) as f64 / dt,
+            util_pct: {
+                let io_ms_delta = curr_dev.diskstats_io_ms.saturating_sub(prev_dev.diskstats_io_ms) as f64;
+                (io_ms_delta / (dt * 1000.0) * 100.0).min(100.0)
+            },
             read_by_type: diff_map(&curr_dev.io_read_by_type, &prev_dev.io_read_by_type),
             write_by_type: diff_map(&curr_dev.io_write_by_type, &prev_dev.io_write_by_type),
             read_latency_ns: curr_dev.io_latency_read_ns,
@@ -123,6 +132,9 @@ pub struct ProcessRate {
     pub name: String,
     pub read_bytes_sec: f64,
     pub write_bytes_sec: f64,
+    /// Cumulative total IO since process start.
+    pub total_read: u64,
+    pub total_write: u64,
 }
 
 /// Compute per-process I/O rates. Merges with `previous_rates` so recently-seen
@@ -153,6 +165,8 @@ pub fn compute_process_rates(
                 name: c.name.clone(),
                 read_bytes_sec: rd,
                 write_bytes_sec: wd,
+                total_read: c.read_bytes,
+                total_write: c.write_bytes,
             });
         }
     }
@@ -165,6 +179,8 @@ pub fn compute_process_rates(
                 name: prev_rate.name.clone(),
                 read_bytes_sec: 0.0,
                 write_bytes_sec: 0.0,
+                total_read: prev_rate.total_read,
+                total_write: prev_rate.total_write,
             });
         }
     }
