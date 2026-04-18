@@ -25,7 +25,7 @@
             version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
             src = ./.;
             useFetchCargoVendor = true;
-            cargoHash = "sha256-ZeYsPej+6hlpP+dvBsmolZF7hiMwk0I2S7j93++k6Z4=";
+            cargoHash = "sha256-1HGu29yMYskUr0IEY9Rtw5V6fGlBu+PKyKFvf+TGBu0=";
             meta = {
               description = "A top-like TUI for bcachefs filesystems";
               homepage = "https://github.com/nasty-project/nasty-top";
