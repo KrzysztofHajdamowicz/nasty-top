@@ -2,6 +2,7 @@ mod advisor;
 mod app;
 mod metrics;
 mod sysfs;
+mod theme;
 mod tuning;
 mod ui;
 

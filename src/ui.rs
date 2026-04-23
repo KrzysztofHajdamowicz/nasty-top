@@ -1,21 +1,89 @@
-//! TUI rendering with ratatui.
+//! TUI rendering with ratatui — btop-inspired visual style.
 
 use crate::app::{App, Focus};
+use crate::theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Sparkline, Table, Wrap,
+    Axis, Block, BorderType, Borders, Cell, Chart, Dataset, GraphType,
+    Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
+
+// ── Helpers ──
+
+fn rounded_block_styled(title: Span<'_>, border_color: Color) -> Block<'_> {
+    Block::default()
+        .title(Line::from(vec![Span::raw(" "), title, Span::raw(" ")]))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+}
+
+fn focused_border(app: &App, panel: Focus) -> Style {
+    if app.focus == panel {
+        theme::border_focused()
+    } else {
+        theme::border_dim()
+    }
+}
+
+// ── Gradient meter bar rendering ──
+
+fn render_gauge(f: &mut Frame, area: Rect, label: &str, pct: f64, label_style: Style) {
+    if area.width < 4 || area.height < 1 {
+        return;
+    }
+    let clamped = pct.clamp(0.0, 100.0);
+    let label_len = label.len() as u16 + 1;
+    let bar_width = area.width.saturating_sub(label_len + 6);
+    let filled = ((clamped / 100.0) * bar_width as f64) as u16;
+
+    let mut spans = vec![
+        Span::styled(format!("{label} "), label_style),
+    ];
+
+    for i in 0..bar_width {
+        if i < filled {
+            let frac = i as f64 / bar_width as f64;
+            let color = theme::gradient_color(frac);
+            spans.push(Span::styled("\u{2501}", Style::default().fg(color)));
+        } else {
+            spans.push(Span::styled("\u{2500}", Style::default().fg(theme::BORDER_DIM)));
+        }
+    }
+
+    let pct_color = theme::gradient_color(clamped / 100.0);
+    spans.push(Span::styled(
+        format!(" {:>3.0}%", clamped),
+        Style::default().fg(pct_color),
+    ));
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Styled footer key hint: [key] label
+fn key_hint<'a>(key: &'a str, label: &'a str) -> Vec<Span<'a>> {
+    vec![
+        Span::styled(
+            format!(" {key} "),
+            Style::default().fg(theme::FG).bg(theme::KEY_BG),
+        ),
+        Span::styled(format!("{label} "), theme::dim()),
+    ]
+}
+
+// ── Main draw entry ──
 
 pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header
+            Constraint::Length(1), // header (slim bar, no border)
             Constraint::Min(10),  // body
-            Constraint::Length(2), // footer (proposal can be long)
+            Constraint::Length(1), // footer (single line menu bar)
         ])
         .split(f.area());
 
@@ -57,16 +125,34 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         String::new()
     };
 
-    let title = format!(
-        " nasty-top v{} │ {} ({}) │ {:.1} GiB / {:.1} GiB ({:.1}%) │ {}x {}{}",
-        env!("CARGO_PKG_VERSION"),
-        fs.fs_name, fs.mount_point, used_gb, total_gb, pct, replicas, compression, fs_indicator
-    );
+    let title_line = Line::from(vec![
+        Span::styled(
+            format!(" nasty-top v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(theme::ACCENT).bg(theme::HEADER_BG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", Style::default().bg(theme::HEADER_BG)),
+        Span::styled(
+            format!("{} ({})", fs.fs_name, fs.mount_point),
+            Style::default().fg(theme::FG).bg(theme::HEADER_BG),
+        ),
+        Span::styled("  ", Style::default().bg(theme::HEADER_BG)),
+        Span::styled(
+            format!("{:.1}/{:.1} GiB ", used_gb, total_gb),
+            Style::default().fg(theme::FG).bg(theme::HEADER_BG),
+        ),
+        Span::styled(
+            format!("({:.1}%)", pct),
+            Style::default().fg(theme::gradient_color(pct / 100.0)).bg(theme::HEADER_BG),
+        ),
+        Span::styled("  ", Style::default().bg(theme::HEADER_BG)),
+        Span::styled(
+            format!("{}x {}{} ", replicas, compression, fs_indicator),
+            Style::default().fg(theme::DIM).bg(theme::HEADER_BG),
+        ),
+    ]);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let para = Paragraph::new(title).block(block);
+    // Fill the rest of the line with background color
+    let para = Paragraph::new(title_line).style(Style::default().bg(theme::HEADER_BG));
     f.render_widget(para, area);
 }
 
@@ -75,8 +161,8 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(60), // metrics
-                Constraint::Percentage(40), // tuning
+                Constraint::Percentage(60),
+                Constraint::Percentage(40),
             ])
             .split(area);
 
@@ -88,18 +174,13 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
-    let focus_style = if matches!(app.focus, Focus::Metrics) {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+    let focus_style = focused_border(app, Focus::Metrics);
 
     let has_labels = app.rates.as_ref()
         .map(|r| r.devices.iter().any(|d| d.label.is_some()))
         .unwrap_or(false);
-    let left_col_width: u16 = if has_labels { 25 } else { 17 };
+    let left_col_width: u16 = if has_labels { 25 } else { 20 };
 
-    // Table height: header + rows + total/padding + 2 borders
     let dev_count = if app.show_counters {
         app.counter_deltas.len().min(30).max(10)
     } else if app.show_blocked {
@@ -111,16 +192,24 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
     };
     let dev_height = (dev_count + 4) as u16;
 
+    // Dynamic background height: compact when no stalls
+    let bg_count = app.current.background.len() as u16;
+    let bg_height = if !app.stall_events.is_empty() {
+        (bg_count + 3 + app.stall_events.len().min(5) as u16).min(14)
+    } else {
+        bg_count + 2 // borders + content, no wasted space
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(10),         // sparklines (throughput + latency)
-            Constraint::Length(dev_height), // device table
-            Constraint::Length(if app.stall_events.is_empty() { 6 } else { 12 }), // background + stalls
+            Constraint::Length(12),        // sparklines
+            Constraint::Min(dev_height),   // device table (gets extra space)
+            Constraint::Length(bg_height), // background (dynamic)
         ])
         .split(area);
 
-    // ── Sparklines: 3 columns matching device table layout ──
+    // ── Sparklines: 3 columns ──
     {
         let spark_cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -131,117 +220,21 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
             ])
             .split(chunks[0]);
 
-        // Left: system info
-        {
-            let block = Block::default()
-                .title(" System ")
-                .borders(Borders::ALL)
-                .border_style(focus_style);
-            let load = read_loadavg_parts();
-            let uptime = read_uptime();
+        draw_system_panel(f, app, spark_cols[0], focus_style);
 
-            let (jdirty, jtotal) = app.current.journal_fill;
-            let jpct = if jtotal > 0 { jdirty as f64 / jtotal as f64 * 100.0 } else { 0.0 };
-            let jcolor = if jpct > 80.0 { Color::Red } else if jpct > 50.0 { Color::Yellow } else { Color::Green };
+        draw_io_chart(
+            f, app, spark_cols[1],
+            "READ",
+            theme::READ, theme::READ_DIM,
+            "io_read_bytes_sec", "io_read_iops", "avg_read_latency_us",
+        );
 
-            let lines = vec![
-                Line::from(Span::styled(" Load Avg:", Style::default().fg(Color::DarkGray))),
-                Line::from(vec![Span::raw(format!("  1m  {}", load.0))]),
-                Line::from(vec![Span::raw(format!("  5m  {}", load.1))]),
-                Line::from(vec![Span::raw(format!(" 15m  {}", load.2))]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(" IOWait:", Style::default().fg(Color::DarkGray)),
-                    {
-                        let iow = app.iowait_pct;
-                        let color = if iow > 50.0 { Color::Red } else if iow > 20.0 { Color::Yellow } else { Color::Green };
-                        Span::styled(format!(" {:.0}%", iow), Style::default().fg(color))
-                    },
-                ]),
-                Line::from(vec![
-                    Span::styled(" Journal: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("{:.0}%", jpct), Style::default().fg(jcolor).add_modifier(Modifier::BOLD)),
-                ]),
-            ];
-            let para = Paragraph::new(lines).block(block);
-            f.render_widget(para, spark_cols[0]);
-        }
-
-        // Middle: READ sparklines (throughput + latency stacked)
-        {
-            let block = Block::default()
-                .title(Span::styled(" READ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow));
-            let inner = block.inner(spark_cols[1]);
-            f.render_widget(block, spark_cols[1]);
-
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(inner);
-
-            let tp_data = sparkline_u64(app.history.get("io_read_bytes_sec"));
-            let tp_rate = app.history.get("io_read_bytes_sec").last().copied().unwrap_or(0.0);
-            let tp_iops = app.history.get("io_read_iops").last().copied().unwrap_or(0.0);
-            let avg = if tp_iops > 0.0 && tp_rate > 0.0 { format_bytes_short(tp_rate / tp_iops) } else { "0B".into() };
-            let tp_title = format!("{}/s · {:.0} io/s · avg {avg}", format_bytes(tp_rate), tp_iops);
-            let tp_spark = Sparkline::default()
-                .block(Block::default().title(
-                    Span::styled(tp_title, Style::default().fg(Color::Yellow))
-                ))
-                .data(&tp_data)
-                .style(Style::default().fg(Color::Yellow));
-            f.render_widget(tp_spark, rows[0]);
-
-            let lat_data = sparkline_u64(app.history.get("avg_read_latency_us"));
-            let lat_val = app.history.get("avg_read_latency_us").last().copied().unwrap_or(0.0);
-            let lat_spark = Sparkline::default()
-                .block(Block::default().title(
-                    Span::styled(format!("lat {:.0} µs", lat_val), Style::default().fg(Color::Yellow))
-                ))
-                .data(&lat_data)
-                .style(Style::default().fg(Color::Yellow));
-            f.render_widget(lat_spark, rows[1]);
-        }
-
-        // Right: WRITE sparklines (throughput + latency stacked)
-        {
-            let block = Block::default()
-                .title(Span::styled(" WRITE ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue));
-            let inner = block.inner(spark_cols[2]);
-            f.render_widget(block, spark_cols[2]);
-
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(inner);
-
-            let tp_data = sparkline_u64(app.history.get("io_write_bytes_sec"));
-            let tp_rate = app.history.get("io_write_bytes_sec").last().copied().unwrap_or(0.0);
-            let tp_iops = app.history.get("io_write_iops").last().copied().unwrap_or(0.0);
-            let avg = if tp_iops > 0.0 && tp_rate > 0.0 { format_bytes_short(tp_rate / tp_iops) } else { "0B".into() };
-            let tp_title = format!("{}/s · {:.0} io/s · avg {avg}", format_bytes(tp_rate), tp_iops);
-            let tp_spark = Sparkline::default()
-                .block(Block::default().title(
-                    Span::styled(tp_title, Style::default().fg(Color::Blue))
-                ))
-                .data(&tp_data)
-                .style(Style::default().fg(Color::Blue));
-            f.render_widget(tp_spark, rows[0]);
-
-            let lat_data = sparkline_u64(app.history.get("avg_write_latency_us"));
-            let lat_val = app.history.get("avg_write_latency_us").last().copied().unwrap_or(0.0);
-            let lat_spark = Sparkline::default()
-                .block(Block::default().title(
-                    Span::styled(format!("lat {:.0} µs", lat_val), Style::default().fg(Color::Blue))
-                ))
-                .data(&lat_data)
-                .style(Style::default().fg(Color::Blue));
-            f.render_widget(lat_spark, rows[1]);
-        }
+        draw_io_chart(
+            f, app, spark_cols[2],
+            "WRITE",
+            theme::WRITE, theme::WRITE_DIM,
+            "io_write_bytes_sec", "io_write_iops", "avg_write_latency_us",
+        );
     }
 
     // ── Device / Process / Blocked / Counter table ──
@@ -252,278 +245,462 @@ fn draw_metrics_panel(f: &mut Frame, app: &App, area: Rect) {
     } else if app.show_processes {
         draw_process_table(f, app, chunks[1], focus_style);
     } else {
-        let bv = |v: f64| -> String { if v > 0.0 { format_bytes_short(v) } else { "—".into() } };
-
-        let dev_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(left_col_width),
-                Constraint::Percentage(50),
-                Constraint::Percentage(50),
-            ])
-            .split(chunks[1]);
-
-        // Collect rates data
-        let mut sr = [0.0_f64; 5];
-        let mut sw = [0.0_f64; 5];
-        let mut sum_errs = 0u64;
-
-        struct DevData {
-            name: String,
-            label: Option<String>,
-            rv: Vec<f64>,
-            wv: Vec<f64>,
-            read_total: f64,
-            write_total: f64,
-            read_lat: u64,
-            write_lat: u64,
-            read_active: bool,
-            write_active: bool,
-            errors: u64,
-            util_pct: f64,
-        }
-        let mut devs: Vec<DevData> = Vec::new();
-
-        if let Some(rates) = &app.rates {
-            for d in &rates.devices {
-                let rv: Vec<f64> = ["user", "btree", "journal", "sb"].iter()
-                    .map(|t| d.read_by_type.get(*t).copied().unwrap_or(0.0)).collect();
-                let wv: Vec<f64> = ["user", "btree", "journal", "sb"].iter()
-                    .map(|t| d.write_by_type.get(*t).copied().unwrap_or(0.0)).collect();
-                for i in 0..4 { sr[i] += rv[i]; sw[i] += wv[i]; }
-                sr[4] += d.read_bytes_sec;
-                sw[4] += d.write_bytes_sec;
-                sum_errs += d.io_errors;
-                devs.push(DevData {
-                    name: d.name.clone(), label: d.label.clone(), rv, wv,
-                    read_total: d.read_bytes_sec, write_total: d.write_bytes_sec,
-                    read_lat: d.read_latency_ns, write_lat: d.write_latency_ns,
-                    read_active: d.read_active, write_active: d.write_active,
-                    errors: d.io_errors, util_pct: d.util_pct,
-                });
-            }
-        }
-
-        // Left: Device + Err
-        {
-            let block = Block::default()
-                .title(" Devices ")
-                .borders(Borders::ALL)
-                .border_style(focus_style);
-            let has_labels = devs.iter().any(|d| d.label.is_some());
-            let header = if has_labels {
-                Row::new(vec!["Device", "Label", "Err", "Utl"])
-            } else {
-                Row::new(vec!["Device", "Err", "Utl"])
-            }.style(Style::default().add_modifier(Modifier::BOLD));
-
-            let mut rows: Vec<Row> = devs.iter().map(|d| {
-                let es = if d.errors > 0 { Style::default().fg(Color::Red) } else { Style::default() };
-                let uc = if d.util_pct > 80.0 { Color::Red } else if d.util_pct > 50.0 { Color::Yellow } else { Color::Green };
-                let util_s = if d.util_pct > 0.0 { format!("{:.0}%", d.util_pct) } else { "—".into() };
-                if has_labels {
-                    Row::new(vec![
-                        Cell::new(d.name.clone()),
-                        Cell::new(d.label.clone().unwrap_or_default()).style(Style::default().fg(Color::DarkGray)),
-                        Cell::new(format!("{}", d.errors)).style(es),
-                        Cell::new(util_s).style(Style::default().fg(uc)),
-                    ])
-                } else {
-                    Row::new(vec![
-                        Cell::new(d.name.clone()),
-                        Cell::new(format!("{}", d.errors)).style(es),
-                        Cell::new(util_s).style(Style::default().fg(uc)),
-                    ])
-                }
-            }).collect();
-            let total_style = Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan);
-            if has_labels {
-                rows.push(Row::new(vec![
-                    Cell::new("TOTAL").style(total_style),
-                    Cell::new(""),
-                    Cell::new(format!("{}", sum_errs)).style(total_style),
-                    Cell::new(""),
-                ]));
-            } else {
-                rows.push(Row::new(vec![
-                    Cell::new("TOTAL").style(total_style),
-                    Cell::new(format!("{}", sum_errs)).style(total_style),
-                    Cell::new(""),
-                ]));
-            }
-            let widths = if has_labels {
-                vec![Constraint::Length(7), Constraint::Length(6), Constraint::Length(4), Constraint::Length(4)]
-            } else {
-                vec![Constraint::Length(7), Constraint::Length(4), Constraint::Length(4)]
-            };
-            let table = Table::new(rows, widths).header(header).block(block);
-            f.render_widget(table, dev_cols[0]);
-        }
-
-        // Middle: READ
-        {
-            let block = Block::default()
-                .title(Span::styled(" READ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow));
-            let header = Row::new(vec!["user/s", "btree/s", "jrnl/s", "sb/s", "total/s", "lat"])
-                .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow));
-            let rs = Style::default().fg(Color::Yellow);
-            let mut rows: Vec<Row> = devs.iter().map(|d| {
-                Row::new(vec![
-                    Cell::new(bv(d.rv[0])), Cell::new(bv(d.rv[1])),
-                    Cell::new(bv(d.rv[2])), Cell::new(bv(d.rv[3])),
-                    Cell::new(format_bytes_short(d.read_total)),
-                    if d.read_active {
-                        Cell::new(format_latency(d.read_lat)).style(Style::default().fg(latency_color(d.read_lat)))
-                    } else {
-                        Cell::new("—")
-                    },
-                ]).style(rs)
-            }).collect();
-            let bs = Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow);
-            rows.push(Row::new(vec![
-                Cell::new(bv(sr[0])), Cell::new(bv(sr[1])),
-                Cell::new(bv(sr[2])), Cell::new(bv(sr[3])),
-                Cell::new(format_bytes_short(sr[4])), Cell::new(""),
-            ]).style(bs));
-            let w = Constraint::Ratio(1, 6);
-            let widths = [w, w, w, w, w, w];
-            let table = Table::new(rows, widths).header(header).block(block);
-            f.render_widget(table, dev_cols[1]);
-        }
-
-        // Right: WRITE
-        {
-            let block = Block::default()
-                .title(Span::styled(" WRITE ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue));
-            let header = Row::new(vec!["user/s", "btree/s", "jrnl/s", "sb/s", "total/s", "lat"])
-                .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Blue));
-            let ws = Style::default().fg(Color::Blue);
-            let mut rows: Vec<Row> = devs.iter().map(|d| {
-                Row::new(vec![
-                    Cell::new(bv(d.wv[0])), Cell::new(bv(d.wv[1])),
-                    Cell::new(bv(d.wv[2])), Cell::new(bv(d.wv[3])),
-                    Cell::new(format_bytes_short(d.write_total)),
-                    if d.write_active {
-                        Cell::new(format_latency(d.write_lat)).style(Style::default().fg(latency_color(d.write_lat)))
-                    } else {
-                        Cell::new("—")
-                    },
-                ]).style(ws)
-            }).collect();
-            let bs = Style::default().add_modifier(Modifier::BOLD).fg(Color::Blue);
-            rows.push(Row::new(vec![
-                Cell::new(bv(sw[0])), Cell::new(bv(sw[1])),
-                Cell::new(bv(sw[2])), Cell::new(bv(sw[3])),
-                Cell::new(format_bytes_short(sw[4])), Cell::new(""),
-            ]).style(bs));
-            let w = Constraint::Ratio(1, 6);
-            let widths = [w, w, w, w, w, w];
-            let table = Table::new(rows, widths).header(header).block(block);
-            f.render_widget(table, dev_cols[2]);
-        }
+        draw_device_table(f, app, chunks[1], focus_style, has_labels, left_col_width);
     }
 
     // ── Background + Stalls ──
-    {
-        let has_stalls = !app.stall_events.is_empty();
-        let title = if has_stalls { " Background ── STALLS DETECTED " } else { " Background " };
-        let border_color = if has_stalls { Color::Red } else { focus_style.fg.unwrap_or(Color::DarkGray) };
-        let block = Block::default()
-            .title(Span::styled(title, Style::default().fg(border_color)))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color));
+    draw_background(f, app, chunks[2], focus_style);
+}
 
-        let mut lines: Vec<Line> = app.current.background
-            .iter()
-            .map(|(k, v)| {
-                let color = if v.starts_with("off") {
-                    Color::DarkGray
-                } else if v.contains("running") || v.contains("on") {
-                    Color::Green
-                } else {
-                    Color::default()
-                };
-                Line::from(vec![
-                    Span::styled(format!("{k}: "), Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(v.to_string(), Style::default().fg(color)),
-                ])
+fn draw_system_panel(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
+    let block = Block::default()
+        .title(Span::styled(" System ", theme::bold(theme::ACCENT)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(focus_style);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height < 3 {
+        return;
+    }
+
+    let load = read_loadavg_parts();
+
+    let (jdirty, jtotal) = app.current.journal_fill;
+    let jpct = if jtotal > 0 { jdirty as f64 / jtotal as f64 * 100.0 } else { 0.0 };
+
+    let space_pct = if app.current.space_total > 0 {
+        app.current.space_used as f64 / app.current.space_total as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // load avg
+            Constraint::Length(1), // uptime
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // iowait gauge
+            Constraint::Length(1), // journal gauge
+            Constraint::Length(1), // disk gauge
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    let load_line = Line::from(vec![
+        Span::styled(" Load ", theme::dim()),
+        Span::styled(&load.0, Style::default().fg(theme::FG)),
+        Span::styled(" \u{2502} ", Style::default().fg(theme::BORDER_DIM)),
+        Span::styled(&load.1, Style::default().fg(theme::FG)),
+        Span::styled(" \u{2502} ", Style::default().fg(theme::BORDER_DIM)),
+        Span::styled(&load.2, Style::default().fg(theme::FG)),
+    ]);
+    f.render_widget(Paragraph::new(load_line), rows[0]);
+
+    let uptime = read_uptime();
+    let up_line = Line::from(vec![
+        Span::styled(" Up ", theme::dim()),
+        Span::styled(uptime, Style::default().fg(theme::DIM)),
+    ]);
+    f.render_widget(Paragraph::new(up_line), rows[1]);
+
+    render_gauge(f, rows[3], " IOw", app.iowait_pct, theme::dim());
+    render_gauge(f, rows[4], " Jnl", jpct, theme::dim());
+    render_gauge(f, rows[5], " Dsk", space_pct, theme::dim());
+}
+
+fn draw_io_chart(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    label: &str,
+    color: Color,
+    fill_color: Color,
+    tp_key: &str,
+    iops_key: &str,
+    lat_key: &str,
+) {
+    let block = rounded_block_styled(
+        Span::styled(label, theme::bold(color)),
+        color,
+    );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width < 4 || inner.height < 4 {
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(inner);
+
+    // ── Throughput chart ──
+    let tp_data = app.history.get(tp_key);
+    let tp_rate = tp_data.last().copied().unwrap_or(0.0);
+    let tp_iops = app.history.get(iops_key).last().copied().unwrap_or(0.0);
+    let tp_title = format!("{}/s  {:.0} io/s", format_bytes(tp_rate), tp_iops);
+
+    draw_braille_area_chart(f, rows[0], tp_data, color, fill_color, &tp_title);
+
+    // ── Latency chart ──
+    let lat_data = app.history.get(lat_key);
+    let lat_val = lat_data.last().copied().unwrap_or(0.0);
+    let lat_title = format!("lat {:.0} \u{00B5}s", lat_val);
+
+    draw_braille_area_chart(f, rows[1], lat_data, color, fill_color, &lat_title);
+}
+
+fn draw_braille_area_chart(
+    f: &mut Frame,
+    area: Rect,
+    data: &[f64],
+    line_color: Color,
+    fill_color: Color,
+    title: &str,
+) {
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+
+    let max_val = data.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+
+    let visible_len = (area.width as usize * 2).min(data.len());
+    let start = data.len().saturating_sub(visible_len);
+    let points: Vec<(f64, f64)> = data[start..]
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as f64, v))
+        .collect();
+
+    let fill_points: Vec<(f64, f64)> = data[start..]
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &v)| {
+            let steps = (area.height as usize * 4).max(8);
+            (0..steps).map(move |s| {
+                let y = v * s as f64 / steps as f64;
+                (i as f64, y)
             })
-            .collect();
+        })
+        .collect();
 
-        // Append recent stall events
-        if has_stalls {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "Recent stalls:",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )));
-            let now = std::time::Instant::now();
-            for ev in app.stall_events.iter().take(5) {
-                let ago = now.duration_since(ev.time).as_secs();
-                lines.push(Line::from(Span::styled(
-                    format!("  {}s ago  {}  {}  {}", ago, ev.device, ev.direction, ev.detail),
-                    Style::default().fg(Color::Red),
-                )));
-            }
+    let x_max = points.len().max(1) as f64;
+
+    let datasets = vec![
+        Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(fill_color))
+            .data(&fill_points),
+        Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(line_color))
+            .data(&points),
+    ];
+
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .title(Span::styled(title, Style::default().fg(line_color)))
+        )
+        .x_axis(
+            Axis::default()
+                .bounds([0.0, x_max])
+                .style(Style::default().fg(theme::BORDER_DIM))
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, max_val])
+                .style(Style::default().fg(theme::BORDER_DIM))
+        );
+
+    f.render_widget(chart, area);
+}
+
+fn draw_device_table(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    focus_style: Style,
+    has_labels: bool,
+    left_col_width: u16,
+) {
+    let bv = |v: f64| -> String {
+        if v > 0.0 { format_bytes_short(v) } else { "\u{2014}".into() }
+    };
+
+    let dev_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(left_col_width),
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
+        .split(area);
+
+    let mut sr = [0.0_f64; 5];
+    let mut sw = [0.0_f64; 5];
+    let mut sum_errs = 0u64;
+
+    struct DevData {
+        name: String,
+        label: Option<String>,
+        rv: Vec<f64>,
+        wv: Vec<f64>,
+        read_total: f64,
+        write_total: f64,
+        read_lat: u64,
+        write_lat: u64,
+        read_active: bool,
+        write_active: bool,
+        errors: u64,
+        util_pct: f64,
+    }
+    let mut devs: Vec<DevData> = Vec::new();
+
+    if let Some(rates) = &app.rates {
+        for d in &rates.devices {
+            let rv: Vec<f64> = ["user", "btree", "journal", "sb"].iter()
+                .map(|t| d.read_by_type.get(*t).copied().unwrap_or(0.0)).collect();
+            let wv: Vec<f64> = ["user", "btree", "journal", "sb"].iter()
+                .map(|t| d.write_by_type.get(*t).copied().unwrap_or(0.0)).collect();
+            for i in 0..4 { sr[i] += rv[i]; sw[i] += wv[i]; }
+            sr[4] += d.read_bytes_sec;
+            sw[4] += d.write_bytes_sec;
+            sum_errs += d.io_errors;
+            devs.push(DevData {
+                name: d.name.clone(), label: d.label.clone(), rv, wv,
+                read_total: d.read_bytes_sec, write_total: d.write_bytes_sec,
+                read_lat: d.read_latency_ns, write_lat: d.write_latency_ns,
+                read_active: d.read_active, write_active: d.write_active,
+                errors: d.io_errors, util_pct: d.util_pct,
+            });
         }
+    }
 
-        let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
-        f.render_widget(para, chunks[2]);
+    // Left: Device + Err + Util (with mini bar)
+    {
+        let block = Block::default()
+            .title(Span::styled(" Devices ", theme::bold(theme::ACCENT)))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(focus_style);
+        let header = if has_labels {
+            Row::new(vec!["Device", "Label", "Err", "Utl"])
+        } else {
+            Row::new(vec!["Device", "Err", "Utl"])
+        }.style(theme::bold(theme::FG));
+
+        let mut rows: Vec<Row> = devs.iter().enumerate().map(|(i, d)| {
+            let es = if d.errors > 0 { Style::default().fg(theme::RED) } else { Style::default().fg(theme::FG) };
+            let uc = if d.util_pct > 80.0 { theme::RED } else if d.util_pct > 50.0 { theme::YELLOW } else { theme::GREEN };
+            let util_s = if d.util_pct > 0.0 { format!("{:.0}%", d.util_pct) } else { "\u{2014}".into() };
+            let util_cell = Cell::new(util_s).style(Style::default().fg(uc));
+            let row_bg = if i % 2 == 1 { Style::default().bg(theme::ROW_ALT) } else { Style::default() };
+            if has_labels {
+                Row::new(vec![
+                    Cell::new(d.name.clone()).style(Style::default().fg(theme::FG)),
+                    Cell::new(d.label.clone().unwrap_or_default()).style(theme::dim()),
+                    Cell::new(format!("{}", d.errors)).style(es),
+                    util_cell,
+                ]).style(row_bg)
+            } else {
+                Row::new(vec![
+                    Cell::new(d.name.clone()).style(Style::default().fg(theme::FG)),
+                    Cell::new(format!("{}", d.errors)).style(es),
+                    util_cell,
+                ]).style(row_bg)
+            }
+        }).collect();
+        let total_style = theme::bold(theme::CYAN);
+        if has_labels {
+            rows.push(Row::new(vec![
+                Cell::new("TOTAL").style(total_style),
+                Cell::new(""),
+                Cell::new(format!("{}", sum_errs)).style(total_style),
+                Cell::new(""),
+            ]));
+        } else {
+            rows.push(Row::new(vec![
+                Cell::new("TOTAL").style(total_style),
+                Cell::new(format!("{}", sum_errs)).style(total_style),
+                Cell::new(""),
+            ]));
+        }
+        let widths = if has_labels {
+            vec![Constraint::Length(7), Constraint::Min(4), Constraint::Length(4), Constraint::Length(5)]
+        } else {
+            vec![Constraint::Min(6), Constraint::Length(4), Constraint::Length(5)]
+        };
+        let table = Table::new(rows, widths).header(header).block(block);
+        f.render_widget(table, dev_cols[0]);
+    }
+
+    // Middle: READ
+    {
+        let block = rounded_block_styled(
+            Span::styled("READ", theme::bold(theme::READ)),
+            theme::READ,
+        );
+        let header = Row::new(vec!["user/s", "btree/s", "jrnl/s", "sb/s", "total/s", "lat"])
+            .style(theme::bold(theme::READ));
+        let rs = Style::default().fg(theme::READ);
+        let mut rows: Vec<Row> = devs.iter().enumerate().map(|(i, d)| {
+            let row_bg = if i % 2 == 1 { rs.bg(theme::ROW_ALT) } else { rs };
+            Row::new(vec![
+                Cell::new(bv(d.rv[0])), Cell::new(bv(d.rv[1])),
+                Cell::new(bv(d.rv[2])), Cell::new(bv(d.rv[3])),
+                Cell::new(format_bytes_short(d.read_total)),
+                if d.read_active {
+                    Cell::new(format_latency(d.read_lat)).style(Style::default().fg(theme::latency_color(d.read_lat)))
+                } else {
+                    Cell::new("\u{2014}")
+                },
+            ]).style(row_bg)
+        }).collect();
+        let bs = theme::bold(theme::READ);
+        rows.push(Row::new(vec![
+            Cell::new(bv(sr[0])), Cell::new(bv(sr[1])),
+            Cell::new(bv(sr[2])), Cell::new(bv(sr[3])),
+            Cell::new(format_bytes_short(sr[4])), Cell::new(""),
+        ]).style(bs));
+        let w = Constraint::Ratio(1, 6);
+        let widths = [w, w, w, w, w, w];
+        let table = Table::new(rows, widths).header(header).block(block);
+        f.render_widget(table, dev_cols[1]);
+    }
+
+    // Right: WRITE
+    {
+        let block = rounded_block_styled(
+            Span::styled("WRITE", theme::bold(theme::WRITE)),
+            theme::WRITE,
+        );
+        let header = Row::new(vec!["user/s", "btree/s", "jrnl/s", "sb/s", "total/s", "lat"])
+            .style(theme::bold(theme::WRITE));
+        let ws = Style::default().fg(theme::WRITE);
+        let mut rows: Vec<Row> = devs.iter().enumerate().map(|(i, d)| {
+            let row_bg = if i % 2 == 1 { ws.bg(theme::ROW_ALT) } else { ws };
+            Row::new(vec![
+                Cell::new(bv(d.wv[0])), Cell::new(bv(d.wv[1])),
+                Cell::new(bv(d.wv[2])), Cell::new(bv(d.wv[3])),
+                Cell::new(format_bytes_short(d.write_total)),
+                if d.write_active {
+                    Cell::new(format_latency(d.write_lat)).style(Style::default().fg(theme::latency_color(d.write_lat)))
+                } else {
+                    Cell::new("\u{2014}")
+                },
+            ]).style(row_bg)
+        }).collect();
+        let bs = theme::bold(theme::WRITE);
+        rows.push(Row::new(vec![
+            Cell::new(bv(sw[0])), Cell::new(bv(sw[1])),
+            Cell::new(bv(sw[2])), Cell::new(bv(sw[3])),
+            Cell::new(format_bytes_short(sw[4])), Cell::new(""),
+        ]).style(bs));
+        let w = Constraint::Ratio(1, 6);
+        let widths = [w, w, w, w, w, w];
+        let table = Table::new(rows, widths).header(header).block(block);
+        f.render_widget(table, dev_cols[2]);
     }
 }
 
-fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
-    let focus_style = if matches!(app.focus, Focus::Tuning) {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+fn draw_background(f: &mut Frame, app: &App, area: Rect, focus_style: Style) {
+    let has_stalls = !app.stall_events.is_empty();
+    let title = if has_stalls { "Background \u{2500}\u{2500} STALLS DETECTED" } else { "Background" };
+    let border_color = if has_stalls { theme::RED } else { focus_style.fg.unwrap_or(theme::BORDER_DIM) };
+    let block = Block::default()
+        .title(Span::styled(format!(" {title} "), Style::default().fg(border_color)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
 
-    {
-        let block = Block::default()
-            .title(" Options (Enter to edit) ")
-            .borders(Borders::ALL)
-            .border_style(focus_style);
+    let mut lines: Vec<Line> = app.current.background
+        .iter()
+        .map(|(k, v)| {
+            let color = if v.starts_with("off") {
+                theme::DIM
+            } else if v.contains("running") || v.contains("on") {
+                theme::GREEN
+            } else {
+                theme::FG
+            };
+            Line::from(vec![
+                Span::styled(format!("{k}: "), theme::bold(theme::FG)),
+                Span::styled(v.to_string(), Style::default().fg(color)),
+            ])
+        })
+        .collect();
 
-        let tuning = &app.tuning;
-        let options = &app.current.options;
-
-        let rows: Vec<Row> = tuning
-            .option_names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                let value = options.get(name).map(|s| s.as_str()).unwrap_or("?");
-
-                let display = if tuning.editing && i == tuning.selected {
-                    format!("{}▏", tuning.edit_buf)
-                } else {
-                    value.to_string()
-                };
-
-                let style = if i == tuning.selected && matches!(app.focus, Focus::Tuning) {
-                    if tuning.editing {
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::REVERSED)
-                    }
-                } else {
-                    Style::default()
-                };
-
-                Row::new(vec![name.clone(), display]).style(style)
-            })
-            .collect();
-
-        let widths = [Constraint::Min(20), Constraint::Length(15)];
-        let table = Table::new(rows, widths).block(block);
-        f.render_widget(table, area);
+    if has_stalls {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Recent stalls:",
+            theme::bold(theme::RED),
+        )));
+        let now = std::time::Instant::now();
+        for ev in app.stall_events.iter().take(5) {
+            let ago = now.duration_since(ev.time).as_secs();
+            lines.push(Line::from(Span::styled(
+                format!("  {}s ago  {}  {}  {}", ago, ev.device, ev.direction, ev.detail),
+                Style::default().fg(theme::RED),
+            )));
+        }
     }
 
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    f.render_widget(para, area);
+}
+
+fn draw_tuning_panel(f: &mut Frame, app: &App, area: Rect) {
+    let focus_style = focused_border(app, Focus::Tuning);
+
+    let block = Block::default()
+        .title(Span::styled(" Options ", theme::bold(theme::ACCENT)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(focus_style);
+
+    let tuning = &app.tuning;
+    let options = &app.current.options;
+
+    let rows: Vec<Row> = tuning
+        .option_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let value = options.get(name).map(|s| s.as_str()).unwrap_or("?");
+
+            let display = if tuning.editing && i == tuning.selected {
+                format!("{}\u{2581}", tuning.edit_buf)
+            } else {
+                value.to_string()
+            };
+
+            let style = if i == tuning.selected && matches!(app.focus, Focus::Tuning) {
+                if tuning.editing {
+                    Style::default().fg(theme::YELLOW).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::ACCENT).add_modifier(Modifier::REVERSED)
+                }
+            } else if i % 2 == 1 {
+                Style::default().fg(theme::FG).bg(theme::ROW_ALT)
+            } else {
+                Style::default().fg(theme::FG)
+            };
+
+            Row::new(vec![name.clone(), display]).style(style)
+        })
+        .collect();
+
+    let widths = [Constraint::Min(20), Constraint::Length(15)];
+    let table = Table::new(rows, widths).block(block);
+    f.render_widget(table, area);
 }
 
 fn draw_help(f: &mut Frame) {
@@ -534,38 +711,38 @@ fn draw_help(f: &mut Frame) {
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect::new(x, y, w, h);
 
-    // Clear background
     f.render_widget(ratatui::widgets::Clear, popup);
 
     let block = Block::default()
-        .title(" Help — [?] close ")
+        .title(Span::styled(" Help \u{2500} [?] close ", theme::bold(theme::ACCENT)))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Rgb(30, 30, 40)));
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .style(Style::default().bg(theme::BG));
 
     let help_text = vec![
-        Line::from(Span::styled("Views", Style::default().add_modifier(Modifier::BOLD))),
-        Line::from("  c  counters (all sysfs counters)"),
-        Line::from("  t  blocked stats (time_stats)"),
-        Line::from("  p  process IO (top by throughput)"),
-        Line::from("  o  options panel (sysfs editing)"),
-        Line::from("  f  cycle filesystem"),
+        Line::from(Span::styled("Views", theme::bold(theme::ACCENT))),
+        Line::from(Span::styled("  c  counters (all sysfs counters)", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  t  blocked stats (time_stats)", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  p  process IO (top by throughput)", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  o  options panel (sysfs editing)", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  f  cycle filesystem", Style::default().fg(theme::FG))),
         Line::from(""),
-        Line::from(Span::styled("Toggles", Style::default().add_modifier(Modifier::BOLD))),
-        Line::from("  r  reconcile on/off"),
-        Line::from("  g  copygc on/off"),
+        Line::from(Span::styled("Toggles", theme::bold(theme::ACCENT))),
+        Line::from(Span::styled("  r  reconcile on/off", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  g  copygc on/off", Style::default().fg(theme::FG))),
         Line::from(""),
-        Line::from(Span::styled("Options panel", Style::default().add_modifier(Modifier::BOLD))),
-        Line::from("  Tab    switch focus"),
-        Line::from("  ↑↓    navigate options"),
-        Line::from("  Enter  edit selected option"),
-        Line::from("  Esc    cancel edit"),
+        Line::from(Span::styled("Options panel", theme::bold(theme::ACCENT))),
+        Line::from(Span::styled("  Tab    switch focus", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  \u{2191}\u{2193}    navigate options", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  Enter  edit selected option", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  Esc    cancel edit", Style::default().fg(theme::FG))),
         Line::from(""),
-        Line::from(Span::styled("Advisor", Style::default().add_modifier(Modifier::BOLD))),
-        Line::from("  Y  apply suggestion"),
-        Line::from("  N  dismiss (2 min)"),
-        Line::from("  !  never suggest again"),
-        Line::from("  C  clear permanent dismissals"),
+        Line::from(Span::styled("Advisor", theme::bold(theme::ACCENT))),
+        Line::from(Span::styled("  Y  apply suggestion", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  N  dismiss (2 min)", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  !  never suggest again", Style::default().fg(theme::FG))),
+        Line::from(Span::styled("  C  clear permanent dismissals", Style::default().fg(theme::FG))),
     ];
 
     let para = Paragraph::new(help_text).block(block);
@@ -574,50 +751,65 @@ fn draw_help(f: &mut Frame) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if let Some(ref proposal) = app.proposal {
-        // Show proposal with Y to apply
-        let line = Line::from(vec![
-            Span::styled("SUGGEST: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(&proposal.reason, Style::default().fg(Color::Yellow)),
+        let mut spans = vec![
+            Span::styled(" SUGGEST ", Style::default().fg(theme::BG).bg(theme::YELLOW).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {} ", proposal.reason), Style::default().fg(theme::YELLOW)),
+            Span::styled(&proposal.command, theme::bold(theme::FG)),
             Span::raw("  "),
-            Span::styled(&proposal.command, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
-            Span::styled("[Y] apply ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::styled("[N] dismiss ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[!] never", Style::default().fg(Color::DarkGray)),
-        ]);
-        f.render_widget(Paragraph::new(line), area);
+        ];
+        spans.extend(key_hint("Y", "apply"));
+        spans.extend(key_hint("N", "dismiss"));
+        spans.extend(key_hint("!", "never"));
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     } else if let Some(ref msg) = app.status_msg {
-        let para = Paragraph::new(msg.clone()).style(Style::default().fg(Color::Green));
+        let para = Paragraph::new(Line::from(vec![
+            Span::styled(" \u{2713} ", Style::default().fg(theme::BG).bg(theme::GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {msg}"), Style::default().fg(theme::GREEN)),
+        ]));
         f.render_widget(para, area);
     } else {
-        let mut help = String::from("[?] help  [o] options  [c] counters  [t] blocked  [p] procs  [r] reconcile  [g] copygc  [f] fs  [q] quit");
+        let mut spans: Vec<Span> = Vec::new();
+        spans.extend(key_hint("?", "help"));
+        spans.extend(key_hint("o", "options"));
+        spans.extend(key_hint("c", "counters"));
+        spans.extend(key_hint("t", "blocked"));
+        spans.extend(key_hint("p", "procs"));
+        spans.extend(key_hint("r", "reconcile"));
+        spans.extend(key_hint("g", "copygc"));
+        spans.extend(key_hint("f", "fs"));
+        spans.extend(key_hint("q", "quit"));
         if !app.dismissed_permanent.is_empty() {
-            help.push_str(&format!("  ({} suppressed — [C] clear)", app.dismissed_permanent.len()));
+            spans.push(Span::styled(
+                format!("  {} suppressed ", app.dismissed_permanent.len()),
+                theme::dim(),
+            ));
+            spans.extend(key_hint("C", "clear"));
         }
-        let para = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
-        f.render_widget(para, area);
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 }
 
-// ── Helpers ──
+// ── Alternate view tables ──
 
 fn draw_counter_table(f: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let block = Block::default()
-        .title(" Counters — [c] toggle ")
+        .title(Span::styled(" Counters ", theme::bold(theme::ACCENT)))
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style);
 
     let header = Row::new(vec!["Counter", "/tick", "/s", "Total"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+        .style(theme::bold(theme::FG));
 
-    let interval = 2.0_f64; // tick interval
-    let rows: Vec<Row> = app.counter_deltas.iter().skip(app.view_scroll).map(|(name, delta, total)| {
+    let interval = 2.0_f64;
+    let rows: Vec<Row> = app.counter_deltas.iter().skip(app.view_scroll).enumerate().map(|(i, (name, delta, total))| {
         let active = *delta > 0;
-        let style = if active {
-            Style::default().fg(Color::Yellow)
+        let base = if active {
+            Style::default().fg(theme::READ)
         } else {
-            Style::default().fg(Color::DarkGray)
+            theme::dim()
         };
+        let style = if i % 2 == 1 { base.bg(theme::ROW_ALT) } else { base };
         let per_sec = if active { format!("{:.0}", *delta as f64 / interval) } else { "0".into() };
         Row::new(vec![
             Cell::new(name.clone()),
@@ -639,32 +831,34 @@ fn draw_counter_table(f: &mut Frame, app: &App, area: Rect, border_style: Style)
 
 fn draw_blocked_table(f: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let block = Block::default()
-        .title(" Time Stats — [t] toggle ")
+        .title(Span::styled(" Time Stats ", theme::bold(theme::ACCENT)))
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style);
 
     let header = Row::new(vec!["Operation", "+/tick", "Count", "Mean", "Recent", "Max"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+        .style(theme::bold(theme::FG));
 
     let fmt_ns = |ns: u64| -> String {
-        if ns == 0 { return "—".into(); }
+        if ns == 0 { return "\u{2014}".into(); }
         if ns >= 1_000_000_000 { format!("{:.1}s", ns as f64 / 1e9) }
         else if ns >= 1_000_000 { format!("{:.1}ms", ns as f64 / 1e6) }
-        else if ns >= 1_000 { format!("{:.0}µs", ns as f64 / 1e3) }
+        else if ns >= 1_000 { format!("{:.0}\u{00B5}s", ns as f64 / 1e3) }
         else { format!("{}ns", ns) }
     };
 
-    let rows: Vec<Row> = app.time_stats_view.iter().skip(app.view_scroll).map(|ts| {
+    let rows: Vec<Row> = app.time_stats_view.iter().skip(app.view_scroll).enumerate().map(|(i, ts)| {
         let active = ts.count_delta > 0;
-        let style = if ts.is_blocked && active && ts.recent_ns > 10_000_000 {
-            Style::default().fg(Color::Red)
+        let base = if ts.is_blocked && active && ts.recent_ns > 10_000_000 {
+            Style::default().fg(theme::RED)
         } else if ts.is_blocked && active {
-            Style::default().fg(Color::Rgb(255, 165, 0))
+            Style::default().fg(theme::ORANGE)
         } else if active {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme::READ)
         } else {
-            Style::default().fg(Color::DarkGray)
+            theme::dim()
         };
+        let style = if i % 2 == 1 { base.bg(theme::ROW_ALT) } else { base };
 
         Row::new(vec![
             Cell::new(ts.name.clone()),
@@ -690,25 +884,34 @@ fn draw_blocked_table(f: &mut Frame, app: &App, area: Rect, border_style: Style)
 
 fn draw_process_table(f: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let block = Block::default()
-        .title(" Processes (by I/O) — [p] toggle ")
+        .title(Span::styled(" Processes (by I/O) ", theme::bold(theme::ACCENT)))
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style);
 
     let header = Row::new(vec!["PID", "Process", "Read/s", "Write/s", "Rate", "Total"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+        .style(theme::bold(theme::FG));
 
-    let rows: Vec<Row> = app.process_rates.iter().skip(app.view_scroll).map(|p| {
+    let rows: Vec<Row> = app.process_rates.iter().skip(app.view_scroll).enumerate().map(|(i, p)| {
         let rate = p.read_bytes_sec + p.write_bytes_sec;
         let cumulative = p.total_read + p.total_write;
         let active = rate > 0.0;
-        let dim = Style::default().fg(Color::DarkGray);
+        let row_bg = if i % 2 == 1 { Some(theme::ROW_ALT) } else { None };
+        let dim_s = |bg: Option<Color>| {
+            let s = theme::dim();
+            if let Some(c) = bg { s.bg(c) } else { s }
+        };
+        let fg_s = |color: Color, bg: Option<Color>| {
+            let s = Style::default().fg(color);
+            if let Some(c) = bg { s.bg(c) } else { s }
+        };
         Row::new(vec![
-            Cell::new(format!("{}", p.pid)).style(if active { Style::default() } else { dim }),
-            Cell::new(p.name.clone()).style(if active { Style::default() } else { dim }),
-            Cell::new(format_bytes(p.read_bytes_sec)).style(if active { Style::default().fg(Color::Yellow) } else { dim }),
-            Cell::new(format_bytes(p.write_bytes_sec)).style(if active { Style::default().fg(Color::Blue) } else { dim }),
-            Cell::new(format_bytes(rate)).style(if active { Style::default() } else { dim }),
-            Cell::new(format_bytes(cumulative as f64)).style(Style::default().fg(Color::DarkGray)),
+            Cell::new(format!("{}", p.pid)).style(if active { fg_s(theme::FG, row_bg) } else { dim_s(row_bg) }),
+            Cell::new(p.name.clone()).style(if active { fg_s(theme::FG, row_bg) } else { dim_s(row_bg) }),
+            Cell::new(format_bytes(p.read_bytes_sec)).style(if active { fg_s(theme::READ, row_bg) } else { dim_s(row_bg) }),
+            Cell::new(format_bytes(p.write_bytes_sec)).style(if active { fg_s(theme::WRITE, row_bg) } else { dim_s(row_bg) }),
+            Cell::new(format_bytes(rate)).style(if active { fg_s(theme::FG, row_bg) } else { dim_s(row_bg) }),
+            Cell::new(format_bytes(cumulative as f64)).style(dim_s(row_bg)),
         ])
     }).collect();
 
@@ -724,21 +927,7 @@ fn draw_process_table(f: &mut Frame, app: &App, area: Rect, border_style: Style)
     f.render_widget(table, area);
 }
 
-fn sparkline_u64(data: &[f64]) -> Vec<u64> {
-    data.iter().map(|v| *v as u64).collect()
-}
-
-fn latency_color(ns: u64) -> Color {
-    if ns < 1_000_000 {       // < 1ms
-        Color::Green
-    } else if ns < 10_000_000 { // < 10ms
-        Color::Yellow
-    } else if ns < 100_000_000 { // < 100ms
-        Color::Rgb(255, 165, 0) // orange
-    } else {
-        Color::Red              // >= 100ms (stall territory)
-    }
-}
+// ── Formatting helpers ──
 
 fn format_bytes(bytes_per_sec: f64) -> String {
     if bytes_per_sec >= 1_000_000_000.0 {
@@ -770,36 +959,9 @@ fn format_latency(ns: u64) -> String {
     } else if ns >= 1_000_000 {
         format!("{:.1} ms", ns as f64 / 1_000_000.0)
     } else if ns >= 1_000 {
-        format!("{:.0} µs", ns as f64 / 1_000.0)
+        format!("{:.0} \u{00B5}s", ns as f64 / 1_000.0)
     } else {
         format!("{} ns", ns)
-    }
-}
-
-fn format_type_breakdown(
-    read: &std::collections::HashMap<String, f64>,
-    write: &std::collections::HashMap<String, f64>,
-) -> String {
-    let mut parts = Vec::new();
-    for t in ["user", "btree", "journal", "sb"] {
-        let r = read.get(t).copied().unwrap_or(0.0);
-        let w = write.get(t).copied().unwrap_or(0.0);
-        if r > 0.0 || w > 0.0 {
-            let r_s = if r > 0.0 { format_bytes(r) } else { "—".into() };
-            let w_s = if w > 0.0 { format_bytes(w) } else { "—".into() };
-            parts.push(format!("{t}:{r_s}/{w_s}"));
-        }
-    }
-    if parts.is_empty() { "—".into() } else { parts.join("  ") }
-}
-
-fn format_duration_us_static(us: f64) -> String {
-    if us >= 1_000_000.0 {
-        format!("{:.1} s", us / 1_000_000.0)
-    } else if us >= 1_000.0 {
-        format!("{:.1} ms", us / 1_000.0)
-    } else {
-        format!("{:.0} µs", us)
     }
 }
 
